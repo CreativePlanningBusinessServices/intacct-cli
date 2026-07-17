@@ -23,8 +23,8 @@ pub async fn call(
         .request(method, path, &query_pairs, &header_pairs, body.as_ref())
         .await?;
 
-    // Non-JSON (or empty) success bodies come back as `body: None`; surface
-    // enough to be useful — the status and any Location header — rather than erroring.
+    // Non-JSON (or empty) success bodies come back as `body: None`; surface the status
+    // rather than erroring.
     match response.body {
         Some(json_body) => Ok(json_body),
         None => Ok(json!({"status": response.status})),

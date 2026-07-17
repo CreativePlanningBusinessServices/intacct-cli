@@ -830,7 +830,7 @@ async fn dispatch_describe(
     }
     let name = name.as_deref().expect("checked above");
     let config = crate::config::Config::load(&crate::config::default_config_path())?;
-    let cache_ttl = Duration::from_secs(config.cache_ttl_hours.unwrap_or(24) * 3600);
+    let cache_ttl = Duration::from_secs(config.cache_ttl_hours.unwrap_or(24).saturating_mul(3600));
     let cache_dir = crate::config::default_cache_dir()
         .join("metadata")
         .join(&context.alias);

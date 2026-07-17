@@ -7,6 +7,7 @@ use crate::error::CliError;
 
 const VALID_KEYS: [&str; 2] = ["default_account", "cache_ttl_hours"];
 const DEFAULT_CACHE_TTL_HOURS: u64 = 24;
+const MAX_CACHE_TTL_HOURS: u64 = 8760;
 
 pub fn get(config_path: &Path, key: Option<&str>) -> Result<Value, CliError> {
     let config = Config::load(config_path)?;
@@ -41,6 +42,11 @@ pub fn set(config_path: &Path, key: &str, value: &str) -> Result<Value, CliError
                     "cache_ttl_hours must be a non-negative integer, got '{value}'"
                 ))
             })?;
+            if hours > MAX_CACHE_TTL_HOURS {
+                return Err(CliError::Usage(format!(
+                    "cache_ttl_hours must be between 0 and {MAX_CACHE_TTL_HOURS}"
+                )));
+            }
             config.cache_ttl_hours = Some(hours);
             json!({"cache_ttl_hours": hours})
         }

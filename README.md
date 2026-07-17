@@ -21,6 +21,10 @@ without scraping human-readable text. Modeled on
 cargo install --path .
 ```
 
+Linux builds have no OS-keyring backend wired up (keyring falls back to an
+in-memory mock, so stored credentials do not persist) — macOS and Windows are
+the supported platforms; Linux is CI-only.
+
 ## Bootstrap (once per machine)
 
 ```bash

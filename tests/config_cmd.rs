@@ -66,6 +66,18 @@ fn set_cache_ttl_rejects_non_numeric() {
 }
 
 #[test]
+fn set_cache_ttl_rejects_values_above_one_year() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+
+    let result = config_cmd::set(&config_path, "cache_ttl_hours", "8761");
+    assert!(matches!(result, Err(CliError::Usage(_))));
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("cache_ttl_hours"));
+    assert!(err_msg.contains("8760"));
+}
+
+#[test]
 fn set_cache_ttl_accepts_numeric_and_persists() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");

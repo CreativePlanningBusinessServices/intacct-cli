@@ -67,7 +67,7 @@ pub fn read_data_arg(raw: &str) -> Result<Value, CliError> {
         .map_err(|parse_error| CliError::Usage(format!("--data is not valid JSON: {parse_error}")))
 }
 
-/// Parses repeated `--param`/`--query key=value` flags; used by the restlet and raw commands.
+/// Parses repeated `--param`/`--query key=value` flags; used by the raw command.
 pub fn parse_key_value_pairs(
     pairs: &[String],
     flag_name: &str,

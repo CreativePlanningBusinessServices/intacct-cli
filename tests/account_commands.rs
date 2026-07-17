@@ -4,8 +4,45 @@ use std::sync::Arc;
 
 use intacct_cli::commands::account::{self, AddArgs};
 use intacct_cli::config::AuthFlow;
-use intacct_cli::secrets::{AccountSecrets, MemoryStore, SecretStore};
+use intacct_cli::error::CliError;
+use intacct_cli::secrets::{AccountSecrets, CachedToken, MemoryStore, SecretStore};
 use serde_json::json;
+
+/// A `SecretStore` whose `set` always fails, used to prove that `account::add` writes the
+/// config entry before it ever touches the keychain — so a keychain failure still leaves a
+/// re-runnable config behind rather than an invisible half-added account.
+struct FailingSecretStore {
+    inner: MemoryStore,
+}
+
+impl FailingSecretStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::default(),
+        }
+    }
+}
+
+impl SecretStore for FailingSecretStore {
+    fn get(&self, alias: &str) -> Result<Option<AccountSecrets>, CliError> {
+        self.inner.get(alias)
+    }
+    fn set(&self, _alias: &str, _secrets: &AccountSecrets) -> Result<(), CliError> {
+        Err(CliError::Auth("keychain unavailable: simulated".into()))
+    }
+    fn delete(&self, alias: &str) -> Result<(), CliError> {
+        self.inner.delete(alias)
+    }
+    fn get_token(&self, alias: &str) -> Result<Option<CachedToken>, CliError> {
+        self.inner.get_token(alias)
+    }
+    fn set_token(&self, alias: &str, token: &CachedToken) -> Result<(), CliError> {
+        self.inner.set_token(alias, token)
+    }
+    fn delete_token(&self, alias: &str) -> Result<(), CliError> {
+        self.inner.delete_token(alias)
+    }
+}
 
 fn add_args(alias: &str) -> AddArgs {
     AddArgs {
@@ -110,6 +147,31 @@ async fn revoke_rejects_unknown_alias() {
         result,
         Err(intacct_cli::error::CliError::Usage(_))
     ));
+}
+
+#[tokio::test]
+async fn add_with_failing_keychain_leaves_rerunnable_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let failing_store = FailingSecretStore::new();
+    let http = reqwest::Client::new();
+
+    let add_result = account::add(&config_path, &failing_store, &http, add_args("prod")).await;
+    assert!(matches!(add_result, Err(CliError::Auth(_))));
+
+    // The config-before-keyring ordering means the account entry is already on disk even
+    // though the keychain write failed.
+    let config = intacct_cli::config::Config::load(&config_path).unwrap();
+    assert!(config.accounts.contains_key("prod"));
+    assert_eq!(config.default_account.as_deref(), Some("prod"));
+
+    // Re-running add with a working store against the same config path succeeds.
+    let working_store = MemoryStore::default();
+    let retry_result = account::add(&config_path, &working_store, &http, add_args("prod"))
+        .await
+        .unwrap();
+    assert_eq!(retry_result["alias"], "prod");
+    assert!(working_store.get("prod").unwrap().is_some());
 }
 
 #[tokio::test]
