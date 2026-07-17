@@ -1,5 +1,6 @@
 pub mod account;
 pub mod object;
+pub mod query;
 
 use std::io::Read;
 

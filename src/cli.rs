@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{self, account, object};
+use crate::commands::{self, account, object, query};
 use crate::config::AuthFlow;
 use crate::context::context_for;
 use crate::error::CliError;
@@ -43,6 +43,43 @@ pub enum Command {
     Object {
         #[command(subcommand)]
         action: ObjectAction,
+    },
+    /// Read-only query service: structured filters/ordering, or a raw --body
+    #[command(
+        after_help = "Example: intacct-cli query accounts-payable/vendor --fields key,id --filter '{\"$eq\":{\"status\":\"active\"}}' --all"
+    )]
+    Query {
+        /// Object path, e.g. accounts-payable/vendor (omit when --body is given)
+        object: Option<String>,
+        /// Comma-separated field list (aggregates like sum:amount allowed); required unless --body is given
+        #[arg(long)]
+        fields: Option<String>,
+        /// A filter object, e.g. {"$eq":{"status":"active"}}; may be repeated
+        #[arg(long = "filter")]
+        filters: Vec<String>,
+        #[arg(long = "filter-expression")]
+        filter_expression: Option<String>,
+        /// An orderBy entry, e.g. {"id":"asc"}; may be repeated
+        #[arg(long = "order-by")]
+        order_by: Vec<String>,
+        #[arg(long)]
+        start: Option<u64>,
+        #[arg(long)]
+        size: Option<u64>,
+        /// Page through the full result set, merging pages into one envelope
+        #[arg(long)]
+        all: bool,
+        #[arg(long = "as-of-date")]
+        as_of_date: Option<String>,
+        #[arg(long = "case-sensitive")]
+        case_sensitive: bool,
+        #[arg(long = "include-private")]
+        include_private: bool,
+        #[arg(long = "include-hierarchy-fields")]
+        include_hierarchy_fields: bool,
+        /// Raw request body (JSON, @file, or - for stdin); mutually exclusive with the structured flags
+        #[arg(long)]
+        body: Option<String>,
     },
 }
 
@@ -172,7 +209,104 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
     match &cli.command {
         Command::Account { action } => dispatch_account(cli, action).await,
         Command::Object { action } => dispatch_object(cli, action).await,
+        Command::Query {
+            object,
+            fields,
+            filters,
+            filter_expression,
+            order_by,
+            start,
+            size,
+            all,
+            as_of_date,
+            case_sensitive,
+            include_private,
+            include_hierarchy_fields,
+            body,
+        } => {
+            dispatch_query(
+                cli,
+                object,
+                fields,
+                filters,
+                filter_expression,
+                order_by,
+                *start,
+                *size,
+                *all,
+                as_of_date,
+                *case_sensitive,
+                *include_private,
+                *include_hierarchy_fields,
+                body,
+            )
+            .await
+        }
     }
+}
+
+/// Structured flags and `--body` are mutually exclusive: either give an object path with the
+/// structured flags, or a raw body (`--all` is the one flag that composes with both).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_query(
+    cli: &Cli,
+    object: &Option<String>,
+    fields: &Option<String>,
+    filters: &[String],
+    filter_expression: &Option<String>,
+    order_by: &[String],
+    start: Option<u64>,
+    size: Option<u64>,
+    all: bool,
+    as_of_date: &Option<String>,
+    case_sensitive: bool,
+    include_private: bool,
+    include_hierarchy_fields: bool,
+    body: &Option<String>,
+) -> Result<serde_json::Value, CliError> {
+    let structured_flags_set = object.is_some()
+        || fields.is_some()
+        || !filters.is_empty()
+        || filter_expression.is_some()
+        || !order_by.is_empty()
+        || start.is_some()
+        || size.is_some()
+        || as_of_date.is_some()
+        || case_sensitive
+        || include_private
+        || include_hierarchy_fields;
+
+    let request_body = match body {
+        Some(raw_body) => {
+            if structured_flags_set {
+                return Err(CliError::Usage(
+                    "pass either --body or the structured flags, not both".into(),
+                ));
+            }
+            commands::read_data_arg(raw_body)?
+        }
+        None => {
+            let object = object.clone().ok_or_else(|| {
+                CliError::Usage("OBJECT is required unless --body is given".into())
+            })?;
+            query::build_query_body(&query::QueryArgs {
+                object,
+                fields: fields.clone(),
+                filters: filters.to_vec(),
+                filter_expression: filter_expression.clone(),
+                order_by: order_by.to_vec(),
+                start,
+                size,
+                as_of_date: as_of_date.clone(),
+                case_sensitive,
+                include_private,
+                include_hierarchy_fields,
+            })?
+        }
+    };
+
+    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+    query::run(&context.client, request_body, all).await
 }
 
 async fn dispatch_object(cli: &Cli, action: &ObjectAction) -> Result<serde_json::Value, CliError> {
