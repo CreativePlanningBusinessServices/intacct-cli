@@ -1,12 +1,16 @@
+use std::io::{IsTerminal, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
 use crate::account as domain;
+use crate::auth::authcode;
 use crate::config::{AccountEntry, AuthFlow, Config};
 use crate::context::AccountContext;
 use crate::error::CliError;
-use crate::secrets::{AccountSecrets, SecretStore};
+use crate::secrets::{AccountSecrets, CachedToken, SecretStore};
 
 pub struct AddArgs {
     pub alias: String,
@@ -16,14 +20,27 @@ pub struct AddArgs {
     pub client_secret: String,
     pub user_id: Option<String>,
     pub entity_id: Option<String>,
+    pub port: u16,
+    pub paste: bool,
 }
 
-pub fn add(config_path: &Path, store: &dyn SecretStore, args: AddArgs) -> Result<Value, CliError> {
-    let AuthFlow::ClientCredentials = args.flow else {
-        return Err(CliError::Auth(
-            "auth-code accounts arrive in a later task".into(),
-        ));
-    };
+pub async fn add(
+    config_path: &Path,
+    store: &dyn SecretStore,
+    http: &reqwest::Client,
+    args: AddArgs,
+) -> Result<Value, CliError> {
+    match args.flow {
+        AuthFlow::ClientCredentials => add_client_credentials(config_path, store, args),
+        AuthFlow::AuthCode => add_auth_code(config_path, store, http, args).await,
+    }
+}
+
+fn add_client_credentials(
+    config_path: &Path,
+    store: &dyn SecretStore,
+    args: AddArgs,
+) -> Result<Value, CliError> {
     let user_id = args.user_id.as_deref().ok_or_else(|| {
         CliError::Usage("--user-id is required for the client-credentials flow".into())
     })?;
@@ -33,7 +50,7 @@ pub fn add(config_path: &Path, store: &dyn SecretStore, args: AddArgs) -> Result
     // the config still points at an alias with no stored credentials, which is a self-describing
     // and re-runnable state ("no credentials stored for '<alias>'; run account add"). The
     // reverse order can leave secrets under an alias the config never learns about.
-    let is_default = write_account_entry(config_path, &args, user_id)?;
+    let is_default = write_account_entry(config_path, &args)?;
     store.set(
         &args.alias,
         &AccountSecrets::ClientCredentials {
@@ -47,6 +64,46 @@ pub fn add(config_path: &Path, store: &dyn SecretStore, args: AddArgs) -> Result
         "alias": args.alias,
         "companyId": args.company_id,
         "flow": "client-credentials",
+        "default": is_default,
+    }))
+}
+
+/// The auth-code flow has no offline `--user-id`/secret pair to validate up front — the only
+/// way to know the credentials work is to actually run the interactive login. So the config
+/// entry is written first (same ordering rationale as the client-credentials path above), then
+/// `run_login_flow` drives the browser + loopback listener, and only a successful login gets
+/// its refresh token written to the keychain.
+async fn add_auth_code(
+    config_path: &Path,
+    store: &dyn SecretStore,
+    http: &reqwest::Client,
+    args: AddArgs,
+) -> Result<Value, CliError> {
+    let is_default = write_account_entry(config_path, &args)?;
+    let token = authcode::run_login_flow(
+        http,
+        &args.client_id,
+        &args.client_secret,
+        authcode::LoginOptions {
+            port: args.port,
+            paste: args.paste,
+        },
+    )
+    .await?;
+
+    store.set(
+        &args.alias,
+        &AccountSecrets::AuthCode {
+            client_id: args.client_id.clone(),
+            client_secret: args.client_secret.clone(),
+            refresh_token: token.refresh_token.clone(),
+        },
+    )?;
+
+    Ok(json!({
+        "alias": args.alias,
+        "companyId": args.company_id,
+        "flow": "auth-code",
         "default": is_default,
     }))
 }
@@ -124,17 +181,158 @@ pub async fn test(context: &AccountContext) -> Result<Value, CliError> {
     Ok(json!({"ok": true, "alias": context.alias, "companyId": context.company_id}))
 }
 
-fn write_account_entry(
+/// `--reauth` re-runs the interactive login flow for an auth-code account, overwrites the
+/// stored refresh token (and pre-seeds the access-token cache from the login response so the
+/// immediately-following `test` call doesn't need a second network round trip), then runs the
+/// normal test call. Client-credentials accounts have no browser flow to re-run.
+pub async fn test_with_reauth(
     config_path: &Path,
-    args: &AddArgs,
-    user_id: &str,
-) -> Result<bool, CliError> {
+    store: &dyn SecretStore,
+    http: &reqwest::Client,
+    context: &AccountContext,
+    port: u16,
+    paste: bool,
+) -> Result<Value, CliError> {
+    let config = Config::load(config_path)?;
+    let entry = config.accounts.get(&context.alias).ok_or_else(|| {
+        CliError::Usage(format!(
+            "unknown account alias '{}'; run `intacct-cli account list`",
+            context.alias
+        ))
+    })?;
+    if !matches!(entry.flow, AuthFlow::AuthCode) {
+        return Err(CliError::Usage(
+            "--reauth is only valid for auth-code accounts".into(),
+        ));
+    }
+    let Some(AccountSecrets::AuthCode {
+        client_id,
+        client_secret,
+        ..
+    }) = store.get(&context.alias)?
+    else {
+        return Err(CliError::Auth(format!(
+            "no credentials stored for '{}'; run `intacct-cli account add`",
+            context.alias
+        )));
+    };
+
+    let token = authcode::run_login_flow(
+        http,
+        &client_id,
+        &client_secret,
+        authcode::LoginOptions { port, paste },
+    )
+    .await?;
+
+    store.set(
+        &context.alias,
+        &AccountSecrets::AuthCode {
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+            refresh_token: token.refresh_token.clone(),
+        },
+    )?;
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    store.set_token(
+        &context.alias,
+        &CachedToken {
+            access_token: token.access_token.clone(),
+            expires_at_epoch: now_epoch + token.expires_in,
+        },
+    )?;
+
+    test(context).await
+}
+
+/// Revokes ALL of the account's Intacct API tokens at the authorization server, not just the
+/// one cached locally by this CLI. Interactive by default (must type the alias back) because
+/// that's a wide blast radius; `--yes` skips the prompt for scripted use. Only the cached
+/// access token is cleared locally — the stored refresh token/config entry are left in place so
+/// the account is still visible and its next use fails fast with a clear "run account add"
+/// error instead of silently vanishing from `account list`.
+pub async fn revoke(
+    config_path: &Path,
+    store: Arc<dyn SecretStore>,
+    alias: &str,
+    http: &reqwest::Client,
+    yes: bool,
+) -> Result<Value, CliError> {
+    let config = Config::load(config_path)?;
+    let entry = config.accounts.get(alias).ok_or_else(|| {
+        CliError::Usage(format!(
+            "unknown account alias '{alias}'; run `intacct-cli account list`"
+        ))
+    })?;
+
+    confirm_revoke(alias, yes)?;
+
+    let provider = crate::context::provider_for(alias, entry, store.clone())?;
+    let access_token = provider.access_token().await?;
+
+    let response = http
+        .post(domain::revoke_url())
+        .form(&[("token", access_token.as_str())])
+        .send()
+        .await
+        .map_err(|send_error| CliError::Network(format!("revoke request failed: {send_error}")))?;
+    let status = response.status();
+    let body_text = response.text().await.map_err(|read_error| {
+        CliError::Network(format!("reading revoke response failed: {read_error}"))
+    })?;
+    if !status.is_success() {
+        return Err(CliError::Api {
+            status: status.as_u16(),
+            message: body_text,
+            details: vec![],
+            support_id: None,
+        });
+    }
+    let parsed: Value = serde_json::from_str(&body_text)
+        .map_err(|parse_error| CliError::Auth(format!("bad revoke response: {parse_error}")))?;
+
+    store.delete_token(alias)?;
+
+    Ok(parsed)
+}
+
+fn confirm_revoke(alias: &str, yes: bool) -> Result<(), CliError> {
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::Usage(
+            "revoke requires interactive confirmation; pass --yes to run non-interactively".into(),
+        ));
+    }
+    eprint!(
+        "This revokes ALL Intacct API tokens for this user/company, not just this CLI's. Type the alias to confirm: "
+    );
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|read_error| {
+            CliError::Usage(format!("failed to read confirmation: {read_error}"))
+        })?;
+    if input.trim() != alias {
+        return Err(CliError::Usage(
+            "confirmation did not match alias; revoke aborted".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_account_entry(config_path: &Path, args: &AddArgs) -> Result<bool, CliError> {
     let mut config = Config::load(config_path)?;
     config.accounts.insert(
         args.alias.clone(),
         AccountEntry {
             company_id: args.company_id.clone(),
-            user_id: Some(user_id.to_string()),
+            user_id: args.user_id.clone(),
             entity_id: args.entity_id.clone(),
             flow: args.flow,
         },

@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::Arc;
+
 use intacct_cli::commands::account::{self, AddArgs};
 use intacct_cli::config::AuthFlow;
 use intacct_cli::secrets::{AccountSecrets, MemoryStore, SecretStore};
@@ -14,16 +16,21 @@ fn add_args(alias: &str) -> AddArgs {
         client_secret: "shhh".into(),
         user_id: Some("svc_api".into()),
         entity_id: None,
+        port: 8899,
+        paste: false,
     }
 }
 
-#[test]
-fn add_stores_config_and_secrets_and_first_account_becomes_default() {
+#[tokio::test]
+async fn add_stores_config_and_secrets_and_first_account_becomes_default() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     let store = MemoryStore::default();
+    let http = reqwest::Client::new();
 
-    let result = account::add(&config_path, &store, add_args("prod")).unwrap();
+    let result = account::add(&config_path, &store, &http, add_args("prod"))
+        .await
+        .unwrap();
     assert_eq!(
         result,
         json!({"alias": "prod", "companyId": "creativeplanning",
@@ -43,29 +50,66 @@ fn add_stores_config_and_secrets_and_first_account_becomes_default() {
     assert!(!listed.to_string().contains("shhh"));
 }
 
-#[test]
-fn add_requires_user_id_for_client_credentials() {
+#[tokio::test]
+async fn add_requires_user_id_for_client_credentials() {
     let dir = tempfile::tempdir().unwrap();
     let store = MemoryStore::default();
+    let http = reqwest::Client::new();
     let mut args = add_args("prod");
     args.user_id = None;
     assert!(matches!(
-        account::add(&dir.path().join("config.toml"), &store, args),
+        account::add(&dir.path().join("config.toml"), &store, &http, args).await,
         Err(intacct_cli::error::CliError::Usage(_))
     ));
 }
 
-#[test]
-fn remove_sweeps_config_default_and_secrets() {
+#[tokio::test]
+async fn remove_sweeps_config_default_and_secrets() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     let store = MemoryStore::default();
-    account::add(&config_path, &store, add_args("prod")).unwrap();
+    let http = reqwest::Client::new();
+    account::add(&config_path, &store, &http, add_args("prod"))
+        .await
+        .unwrap();
 
     account::remove(&config_path, &store, "prod").unwrap();
     assert!(store.get("prod").unwrap().is_none());
     let listed = account::list(&config_path).unwrap();
     assert_eq!(listed["count"], 0);
+}
+
+#[tokio::test]
+async fn revoke_without_yes_in_non_interactive_context_is_usage_error() {
+    // cargo test's stdin is never a tty, so the interactive-confirmation branch is
+    // unreachable here and revoke must refuse before making any network call.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let store = MemoryStore::default();
+    let http = reqwest::Client::new();
+    account::add(&config_path, &store, &http, add_args("prod"))
+        .await
+        .unwrap();
+
+    let store: Arc<dyn SecretStore> = Arc::new(store);
+    let result = account::revoke(&config_path, store, "prod", &http, false).await;
+    assert!(matches!(
+        result,
+        Err(intacct_cli::error::CliError::Usage(_))
+    ));
+}
+
+#[tokio::test]
+async fn revoke_rejects_unknown_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+    let http = reqwest::Client::new();
+    let result = account::revoke(&config_path, store, "nope", &http, true).await;
+    assert!(matches!(
+        result,
+        Err(intacct_cli::error::CliError::Usage(_))
+    ));
 }
 
 #[tokio::test]

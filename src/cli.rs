@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -217,7 +218,7 @@ pub enum ObjectAction {
 pub enum AccountAction {
     /// Add or overwrite an account alias; the first account added becomes the default
     #[command(
-        after_help = "Examples:\n  intacct-cli account add prod --company-id creativeplanning --flow client-credentials --client-id CID --user-id svc_api\n  intacct-cli account add sandbox --company-id creativeplanning --flow client-credentials --client-id CID --user-id svc_api --entity-id CentralUS-35\n\nThe client secret is never a flag: set INTACCT_CLI_CLIENT_SECRET, or run interactively to be prompted for it."
+        after_help = "Examples:\n  intacct-cli account add prod --company-id creativeplanning --flow client-credentials --client-id CID --user-id svc_api\n  intacct-cli account add sandbox --company-id creativeplanning --flow client-credentials --client-id CID --user-id svc_api --entity-id CentralUS-35\n  intacct-cli account add prod --company-id creativeplanning --flow auth-code --client-id CID\n\nThe client secret is never a flag: set INTACCT_CLI_CLIENT_SECRET, or run interactively to be prompted for it."
     )]
     Add {
         alias: String,
@@ -232,6 +233,12 @@ pub enum AccountAction {
         user_id: Option<String>,
         #[arg(long = "entity-id")]
         entity_id: Option<String>,
+        /// Loopback port for the auth-code browser redirect
+        #[arg(long, default_value_t = 8899)]
+        port: u16,
+        /// Skip the loopback listener; paste the redirect URL instead (auth-code flow only)
+        #[arg(long)]
+        paste: bool,
     },
     /// List configured account aliases (never prints secrets)
     List,
@@ -241,11 +248,31 @@ pub enum AccountAction {
     /// Remove an account alias and its stored secrets
     #[command(after_help = "Example: intacct-cli account remove prod")]
     Remove { alias: String },
+    /// Revoke ALL of this account's Intacct API tokens at the authorization server
+    #[command(
+        after_help = "Example: intacct-cli account revoke prod\n  intacct-cli account revoke prod --yes"
+    )]
+    Revoke {
+        alias: String,
+        /// Skip the interactive confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Verify stored credentials by calling the metadata catalog
     #[command(
-        after_help = "Example: intacct-cli account test\n  intacct-cli account test --account prod"
+        after_help = "Example: intacct-cli account test\n  intacct-cli account test --account prod\n  intacct-cli account test --account prod --reauth"
     )]
-    Test,
+    Test {
+        /// Re-run the interactive login flow first (auth-code accounts only)
+        #[arg(long)]
+        reauth: bool,
+        /// Loopback port for the auth-code browser redirect, used with --reauth
+        #[arg(long, default_value_t = 8899)]
+        port: u16,
+        /// Skip the loopback listener; paste the redirect URL instead, used with --reauth
+        #[arg(long)]
+        paste: bool,
+    },
 }
 
 pub async fn cli_main() -> i32 {
@@ -520,11 +547,15 @@ async fn dispatch_account(
             client_id,
             user_id,
             entity_id,
+            port,
+            paste,
         } => {
             let client_secret = resolve_client_secret()?;
+            let http = reqwest::Client::new();
             account::add(
                 &config_path,
                 &store,
+                &http,
                 account::AddArgs {
                     alias: alias.clone(),
                     company_id: company_id.clone(),
@@ -533,15 +564,32 @@ async fn dispatch_account(
                     client_secret,
                     user_id: user_id.clone(),
                     entity_id: entity_id.clone(),
+                    port: *port,
+                    paste: *paste,
                 },
             )
+            .await
         }
         AccountAction::List => account::list(&config_path),
         AccountAction::SetDefault { alias } => account::set_default(&config_path, alias),
         AccountAction::Remove { alias } => account::remove(&config_path, &store, alias),
-        AccountAction::Test => {
+        AccountAction::Revoke { alias, yes } => {
+            let http = reqwest::Client::new();
+            account::revoke(&config_path, Arc::new(store), alias, &http, *yes).await
+        }
+        AccountAction::Test {
+            reauth,
+            port,
+            paste,
+        } => {
             let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
-            account::test(&context).await
+            if *reauth {
+                let http = reqwest::Client::new();
+                account::test_with_reauth(&config_path, &store, &http, &context, *port, *paste)
+                    .await
+            } else {
+                account::test(&context).await
+            }
         }
     }
 }
@@ -626,6 +674,8 @@ mod tests {
                     client_id,
                     user_id,
                     entity_id,
+                    port,
+                    paste,
                 },
         } = cli.command
         else {
@@ -637,6 +687,87 @@ mod tests {
         assert_eq!(client_id, "CID");
         assert_eq!(user_id.as_deref(), Some("svc_api"));
         assert_eq!(entity_id, None);
+        assert_eq!(port, 8899);
+        assert!(!paste);
+    }
+
+    #[test]
+    fn account_add_parses_auth_code_flow_with_port_and_paste() {
+        let cli = Cli::try_parse_from([
+            "intacct-cli",
+            "account",
+            "add",
+            "prod",
+            "--company-id",
+            "creativeplanning",
+            "--flow",
+            "auth-code",
+            "--client-id",
+            "CID",
+            "--port",
+            "9000",
+            "--paste",
+        ])
+        .expect("auth-code add should parse");
+        let Command::Account {
+            action:
+                AccountAction::Add {
+                    flow,
+                    user_id,
+                    port,
+                    paste,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert!(matches!(flow, AuthFlow::AuthCode));
+        assert_eq!(user_id, None);
+        assert_eq!(port, 9000);
+        assert!(paste);
+    }
+
+    #[test]
+    fn account_revoke_parses_alias_and_yes_flag() {
+        let cli = Cli::try_parse_from(["intacct-cli", "account", "revoke", "prod", "--yes"])
+            .expect("revoke should parse");
+        let Command::Account {
+            action: AccountAction::Revoke { alias, yes },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(alias, "prod");
+        assert!(yes);
+    }
+
+    #[test]
+    fn account_test_parses_reauth_port_and_paste() {
+        let cli = Cli::try_parse_from([
+            "intacct-cli",
+            "account",
+            "test",
+            "--reauth",
+            "--port",
+            "9001",
+            "--paste",
+        ])
+        .expect("test --reauth should parse");
+        let Command::Account {
+            action:
+                AccountAction::Test {
+                    reauth,
+                    port,
+                    paste,
+                },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert!(reauth);
+        assert_eq!(port, 9001);
+        assert!(paste);
     }
 
     #[test]

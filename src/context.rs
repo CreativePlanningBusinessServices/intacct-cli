@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::account;
 use crate::auth::TokenProvider;
+use crate::auth::authcode::AuthCodeProvider;
 use crate::auth::client_credentials::{ClientCredentialsConfig, ClientCredentialsProvider};
 use crate::client::IaClient;
 use crate::config::{AccountEntry, AuthFlow, Config};
@@ -40,7 +41,7 @@ pub fn context_for(
     })
 }
 
-fn provider_for(
+pub(crate) fn provider_for(
     alias: &str,
     entry: &AccountEntry,
     store: Arc<dyn SecretStore>,
@@ -72,9 +73,14 @@ fn provider_for(
                 store,
             )))
         }
-        (AuthFlow::AuthCode, _) => Err(CliError::Auth(
-            "auth-code accounts arrive in a later task".into(),
-        )),
+        (AuthFlow::AuthCode, AccountSecrets::AuthCode { .. }) => {
+            Ok(Arc::new(AuthCodeProvider::new(
+                reqwest::Client::new(),
+                alias.to_string(),
+                account::token_url(),
+                store,
+            )))
+        }
         _ => Err(CliError::Auth(format!(
             "stored credentials for '{alias}' do not match its configured flow"
         ))),

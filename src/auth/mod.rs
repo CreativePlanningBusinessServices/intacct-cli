@@ -5,7 +5,9 @@ use serde::Deserialize;
 
 use crate::error::CliError;
 
+pub mod authcode;
 pub mod client_credentials;
+pub(crate) mod loopback;
 
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
