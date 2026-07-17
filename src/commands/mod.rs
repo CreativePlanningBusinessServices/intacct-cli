@@ -1,4 +1,5 @@
 pub mod account;
+pub mod composite;
 pub mod describe;
 pub mod job;
 pub mod object;

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{self, account, describe, job, object, query, raw};
+use crate::commands::{self, account, composite, describe, job, object, query, raw};
 use crate::config::AuthFlow;
 use crate::context::context_for;
 use crate::error::CliError;
@@ -129,6 +129,17 @@ pub enum Command {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// Submit a composite batch request (2-10 sub-requests), each with its own method/path/body
+    #[command(
+        after_help = "Sub-request format: {\"method\": \"POST\", \"path\": \"/objects/...\", \"body\": {...}, \"resultReference\": \"vendor\", \"headers\": {...}}\n\nExample: intacct-cli composite --data '[{\"method\":\"GET\",\"path\":\"/objects/accounts-payable/vendor/1\"},{\"method\":\"GET\",\"path\":\"/objects/accounts-payable/vendor/2\"}]'"
+    )]
+    Composite {
+        /// JSON array of 2-10 sub-requests (inline JSON, @file, or - for stdin)
+        #[arg(long)]
+        data: String,
+    },
+    /// Get the session ID for the current Bearer token (XML-API escape hatch)
+    SessionId,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -428,6 +439,15 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             .await
         }
         Command::Job { action } => dispatch_job(cli, action).await,
+        Command::Composite { data } => {
+            let sub_requests = commands::read_data_arg(data)?;
+            let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+            composite::run(&context.client, sub_requests).await
+        }
+        Command::SessionId => {
+            let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+            composite::session_id(&context.client).await
+        }
     }
 }
 
