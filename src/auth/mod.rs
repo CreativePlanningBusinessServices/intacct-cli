@@ -5,6 +5,8 @@ use serde::Deserialize;
 
 use crate::error::CliError;
 
+pub mod client_credentials;
+
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
