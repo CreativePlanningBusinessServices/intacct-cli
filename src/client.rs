@@ -51,70 +51,17 @@ impl IaClient {
         body: Option<&Value>,
     ) -> Result<IaResponse, CliError> {
         let url = resolve_url(&self.base, path);
-
-        let mut reauthorized = false;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let token = self.tokens.access_token().await?;
-            let mut request = self
-                .http
-                .request(method.clone(), &url)
-                .bearer_auth(&token)
-                .query(query);
-            if let Some(entity) = &self.entity {
-                request = request.header("X-IA-API-Param-Entity", entity);
-            }
+        let build_request = || {
+            let mut request = self.http.request(method.clone(), &url).query(query);
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
             if let Some(json_body) = body {
                 request = request.json(json_body);
             }
-
-            let response = request.send().await.map_err(|send_error| {
-                CliError::Network(format!("request to {url} failed: {send_error}"))
-            })?;
-            let status = response.status();
-
-            if status.as_u16() == 401 && !reauthorized && attempt < MAX_ATTEMPTS {
-                self.tokens.invalidate();
-                reauthorized = true;
-                continue;
-            }
-            if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_ATTEMPTS {
-                let delay = retry_after_seconds(&response)
-                    .map(Duration::from_secs)
-                    .unwrap_or_else(|| {
-                        Duration::from_millis(BASE_BACKOFF_MILLIS * 2u64.pow(attempt - 1))
-                    });
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-
-            let location = response
-                .headers()
-                .get("location")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let raw = response.text().await.map_err(|read_error| {
-                CliError::Network(format!("reading response from {url} failed: {read_error}"))
-            })?;
-            let parsed: Option<Value> = if raw.trim().is_empty() {
-                None
-            } else {
-                serde_json::from_str(&raw).ok()
-            };
-
-            if status.is_success() {
-                return Ok(IaResponse {
-                    status: status.as_u16(),
-                    body: parsed,
-                    location,
-                });
-            }
-            return Err(api_error(status.as_u16(), parsed, raw));
-        }
+            request
+        };
+        self.execute_with_retry(&url, &build_request).await
     }
 
     pub async fn request_multipart(
@@ -123,17 +70,26 @@ impl IaClient {
         build_form: &(dyn Fn() -> reqwest::multipart::Form + Send + Sync),
     ) -> Result<IaResponse, CliError> {
         let url = resolve_url(&self.base, path);
+        let build_request = || self.http.post(&url).multipart(build_form());
+        self.execute_with_retry(&url, &build_request).await
+    }
 
+    /// Owns the shared per-attempt control flow: 401 invalidate-and-retry-once,
+    /// 429/5xx Retry-After/backoff, response parsing, and success/error dispatch.
+    /// `build_request` produces a fresh, unauthenticated `RequestBuilder` for each
+    /// attempt (method/url/query/body already applied); this helper adds bearer
+    /// auth and the entity header before sending.
+    async fn execute_with_retry(
+        &self,
+        url: &str,
+        build_request: &(dyn Fn() -> reqwest::RequestBuilder + Send + Sync),
+    ) -> Result<IaResponse, CliError> {
         let mut reauthorized = false;
         let mut attempt = 0;
         loop {
             attempt += 1;
             let token = self.tokens.access_token().await?;
-            let mut request = self
-                .http
-                .post(&url)
-                .bearer_auth(&token)
-                .multipart(build_form());
+            let mut request = build_request().bearer_auth(&token);
             if let Some(entity) = &self.entity {
                 request = request.header("X-IA-API-Param-Entity", entity);
             }

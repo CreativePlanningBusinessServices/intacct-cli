@@ -9,7 +9,7 @@ use intacct_cli::auth::TokenProvider;
 use intacct_cli::client::IaClient;
 use intacct_cli::error::CliError;
 use serde_json::json;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -172,6 +172,33 @@ async fn retries_429_honoring_retry_after_then_succeeds() {
     let client = common::client_for(&server);
     let response = client
         .request(reqwest::Method::GET, "/limited", &[], &[], None)
+        .await
+        .unwrap();
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
+async fn no_entity_header_when_not_configured() {
+    let server = MockServer::start().await;
+    // Mounted with higher priority (lower number) so it wins if the entity
+    // header is ever sent; the plain 200 mock only matches when it's absent.
+    Mock::given(method("GET"))
+        .and(path("/objects/no-entity"))
+        .and(header_exists("X-IA-API-Param-Entity"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/objects/no-entity"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ia::result": []})))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let client = common::client_for(&server);
+    let response = client
+        .request(reqwest::Method::GET, "/objects/no-entity", &[], &[], None)
         .await
         .unwrap();
     assert_eq!(response.status, 200);
