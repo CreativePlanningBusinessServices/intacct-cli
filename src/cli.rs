@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{self, account, describe, object, query, raw};
+use crate::commands::{self, account, describe, job, object, query, raw};
 use crate::config::AuthFlow;
 use crate::context::context_for;
 use crate::error::CliError;
@@ -124,6 +124,11 @@ pub enum Command {
         #[arg(long)]
         data: Option<String>,
     },
+    /// Bulk asynchronous job service: submit a batch, then poll status or fetch results
+    Job {
+        #[command(subcommand)]
+        action: JobAction,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -212,6 +217,47 @@ pub enum ObjectAction {
     /// Delete one or more objects by key (comma-separated for multiple)
     #[command(after_help = "Example: intacct-cli object delete accounts-payable/vendor 42,43")]
     Delete { object_path: String, keys: String },
+}
+
+#[derive(Subcommand)]
+pub enum JobAction {
+    /// Submit a batch of objects as an asynchronous bulk job
+    #[command(
+        after_help = "Examples:\n  intacct-cli job submit accounts-payable/vendor create --data '[{\"name\":\"Acme\"}]'\n  intacct-cli job submit accounts-payable/vendor update --data @vendors.json --callback-url https://example.com/hook"
+    )]
+    Submit {
+        object_name: String,
+        #[arg(value_enum)]
+        operation: JobOperation,
+        /// A JSON array of objects (inline JSON, @file, or - for stdin)
+        #[arg(long)]
+        data: String,
+        #[arg(long = "callback-url")]
+        callback_url: Option<String>,
+    },
+    /// Check a bulk job's status
+    #[command(after_help = "Example: intacct-cli job status 88.JOB1")]
+    Status { job_id: String },
+    /// Fetch a bulk job's full per-operation results (status with download=true)
+    #[command(after_help = "Example: intacct-cli job result 88.JOB1")]
+    Result { job_id: String },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum JobOperation {
+    Create,
+    Update,
+    Delete,
+}
+
+impl JobOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            JobOperation::Create => "create",
+            JobOperation::Update => "update",
+            JobOperation::Delete => "delete",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -381,6 +427,7 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             )
             .await
         }
+        Command::Job { action } => dispatch_job(cli, action).await,
     }
 }
 
@@ -530,6 +577,29 @@ async fn dispatch_object(cli: &Cli, action: &ObjectAction) -> Result<serde_json:
         ObjectAction::Delete { object_path, keys } => {
             object::delete(&context.client, object_path, keys).await
         }
+    }
+}
+
+async fn dispatch_job(cli: &Cli, action: &JobAction) -> Result<serde_json::Value, CliError> {
+    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+    match action {
+        JobAction::Submit {
+            object_name,
+            operation,
+            data,
+            callback_url,
+        } => {
+            job::submit(
+                &context.client,
+                object_name,
+                operation.as_str(),
+                commands::read_data_arg(data)?,
+                callback_url.clone(),
+            )
+            .await
+        }
+        JobAction::Status { job_id } => job::status(&context.client, job_id, false).await,
+        JobAction::Result { job_id } => job::status(&context.client, job_id, true).await,
     }
 }
 
