@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::account;
+use crate::commands::{self, account, object};
 use crate::config::AuthFlow;
 use crate::context::context_for;
 use crate::error::CliError;
@@ -38,6 +38,62 @@ pub enum Command {
         #[command(subcommand)]
         action: AccountAction,
     },
+    /// Generic CRUD against any Intacct REST object (application/object,
+    /// application/document::Type, or platform-apps/nsp::name)
+    Object {
+        #[command(subcommand)]
+        action: ObjectAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ObjectAction {
+    /// Fetch one or more objects by key (comma-separated for multiple)
+    #[command(after_help = "Example: intacct-cli object get accounts-payable/vendor 42")]
+    Get { object_path: String, keys: String },
+    /// List objects, optionally paging through the full result set
+    #[command(
+        after_help = "Examples:\n  intacct-cli object list accounts-payable/vendor\n  intacct-cli object list general-ledger/account --start 1 --size 100 --all"
+    )]
+    List {
+        object_path: String,
+        #[arg(long)]
+        start: Option<u64>,
+        #[arg(long)]
+        size: Option<u64>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Create one object (JSON object) or a batch (JSON array, capped at 500 by the API)
+    #[command(
+        after_help = "Examples:\n  intacct-cli object create accounts-payable/vendor --data '{\"name\":\"Acme\"}'\n  intacct-cli object create accounts-payable/vendor --data @vendors.json --atomic --idempotency-key abc-123"
+    )]
+    Create {
+        object_path: String,
+        #[arg(long)]
+        data: String,
+        #[arg(long)]
+        atomic: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Update one object by key, or a batch (JSON array, each item carrying its own key)
+    #[command(
+        after_help = "Examples:\n  intacct-cli object update accounts-payable/vendor 42 --data '{\"name\":\"Acme Inc\"}'\n  intacct-cli object update accounts-payable/vendor --data '[{\"key\":\"42\",\"name\":\"Acme\"},{\"key\":\"43\",\"name\":\"Beta\"}]'"
+    )]
+    Update {
+        object_path: String,
+        key: Option<String>,
+        #[arg(long)]
+        data: String,
+        #[arg(long)]
+        atomic: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Delete one or more objects by key (comma-separated for multiple)
+    #[command(after_help = "Example: intacct-cli object delete accounts-payable/vendor 42,43")]
+    Delete { object_path: String, keys: String },
 }
 
 #[derive(Subcommand)]
@@ -115,6 +171,57 @@ fn handle_clap_error(clap_error: &clap::Error) -> i32 {
 async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
     match &cli.command {
         Command::Account { action } => dispatch_account(cli, action).await,
+        Command::Object { action } => dispatch_object(cli, action).await,
+    }
+}
+
+async fn dispatch_object(cli: &Cli, action: &ObjectAction) -> Result<serde_json::Value, CliError> {
+    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+    match action {
+        ObjectAction::Get { object_path, keys } => {
+            object::get(&context.client, object_path, keys).await
+        }
+        ObjectAction::List {
+            object_path,
+            start,
+            size,
+            all,
+        } => object::list(&context.client, object_path, *start, *size, *all).await,
+        ObjectAction::Create {
+            object_path,
+            data,
+            atomic,
+            idempotency_key,
+        } => {
+            object::create(
+                &context.client,
+                object_path,
+                commands::read_data_arg(data)?,
+                *atomic,
+                idempotency_key.clone(),
+            )
+            .await
+        }
+        ObjectAction::Update {
+            object_path,
+            key,
+            data,
+            atomic,
+            idempotency_key,
+        } => {
+            object::update(
+                &context.client,
+                object_path,
+                key.as_deref(),
+                commands::read_data_arg(data)?,
+                *atomic,
+                idempotency_key.clone(),
+            )
+            .await
+        }
+        ObjectAction::Delete { object_path, keys } => {
+            object::delete(&context.client, object_path, keys).await
+        }
     }
 }
 
