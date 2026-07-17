@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{self, account, composite, describe, job, object, query, raw};
+use crate::commands::{
+    self, account, composite, describe, export, job, object, query, raw, report, view,
+};
 use crate::config::AuthFlow;
 use crate::context::context_for;
 use crate::error::CliError;
@@ -53,32 +55,11 @@ pub enum Command {
     Query {
         /// Object path, e.g. accounts-payable/vendor (omit when --body is given)
         object: Option<String>,
-        /// Comma-separated field list (aggregates like sum:amount allowed); required unless --body is given
-        #[arg(long)]
-        fields: Option<String>,
-        /// A filter object, e.g. {"$eq":{"status":"active"}}; may be repeated
-        #[arg(long = "filter")]
-        filters: Vec<String>,
-        #[arg(long = "filter-expression")]
-        filter_expression: Option<String>,
-        /// An orderBy entry, e.g. {"id":"asc"}; may be repeated
-        #[arg(long = "order-by")]
-        order_by: Vec<String>,
-        #[arg(long)]
-        start: Option<u64>,
-        #[arg(long)]
-        size: Option<u64>,
+        #[command(flatten)]
+        query: QueryFlags,
         /// Page through the full result set, merging pages into one envelope
         #[arg(long)]
         all: bool,
-        #[arg(long = "as-of-date")]
-        as_of_date: Option<String>,
-        #[arg(long = "case-sensitive")]
-        case_sensitive: bool,
-        #[arg(long = "include-private")]
-        include_private: bool,
-        #[arg(long = "include-hierarchy-fields")]
-        include_hierarchy_fields: bool,
         /// Raw request body (JSON, @file, or - for stdin); mutually exclusive with the structured flags
         #[arg(long)]
         body: Option<String>,
@@ -140,6 +121,208 @@ pub enum Command {
     },
     /// Get the session ID for the current Bearer token (XML-API escape hatch)
     SessionId,
+    /// Execute a system or user view, or list system views for an object
+    #[command(
+        after_help = "Examples:\n  intacct-cli view run expenses/employee-expense::systemfw1 --view-type system --size 10\n  intacct-cli view list accounts-payable/vendor"
+    )]
+    View {
+        #[command(subcommand)]
+        action: ViewAction,
+    },
+    /// Export query results to a file (pdf, csv, word, xml, or xlsx)
+    #[command(
+        after_help = "Examples:\n  intacct-cli export accounts-payable/vendor --file-type csv --output vendors.csv --fields key,id,name\n  intacct-cli export --file-type xlsx --output out.xlsx --body '{\"object\":\"accounts-payable/vendor\",\"fields\":[\"key\"]}'"
+    )]
+    Export {
+        /// Object path, e.g. accounts-payable/vendor (omit when --body is given)
+        object: Option<String>,
+        #[arg(value_enum, long = "file-type")]
+        file_type: FileTypeArg,
+        /// File path to write the exported binary to; refuses to overwrite an existing file
+        #[arg(long)]
+        output: std::path::PathBuf,
+        #[command(flatten)]
+        query: QueryFlags,
+        /// Raw query body (JSON, @file, or - for stdin); mutually exclusive with the structured flags
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Run, check, download, or cancel a stored/memorized report
+    Report {
+        #[command(subcommand)]
+        action: ReportAction,
+    },
+}
+
+/// Structured query flags shared by `query` and `export` (the exported file's contents are
+/// governed by the same query grammar as `/services/core/query`).
+#[derive(clap::Args)]
+pub struct QueryFlags {
+    /// Comma-separated field list (aggregates like sum:amount allowed); required unless --body is given
+    #[arg(long)]
+    pub fields: Option<String>,
+    /// A filter object, e.g. {"$eq":{"status":"active"}}; may be repeated
+    #[arg(long = "filter")]
+    pub filters: Vec<String>,
+    #[arg(long = "filter-expression")]
+    pub filter_expression: Option<String>,
+    /// An orderBy entry, e.g. {"id":"asc"}; may be repeated
+    #[arg(long = "order-by")]
+    pub order_by: Vec<String>,
+    #[arg(long)]
+    pub start: Option<u64>,
+    #[arg(long)]
+    pub size: Option<u64>,
+    #[arg(long = "as-of-date")]
+    pub as_of_date: Option<String>,
+    #[arg(long = "case-sensitive")]
+    pub case_sensitive: bool,
+    #[arg(long = "include-private")]
+    pub include_private: bool,
+    #[arg(long = "include-hierarchy-fields")]
+    pub include_hierarchy_fields: bool,
+}
+
+#[derive(Subcommand)]
+pub enum ViewAction {
+    /// Execute a system or user view by key
+    #[command(
+        after_help = "Example: intacct-cli view run expenses/employee-expense::systemfw1 --view-type system --size 10"
+    )]
+    Run {
+        key: String,
+        #[arg(value_enum, long = "view-type")]
+        view_type: ViewTypeArg,
+        #[arg(long)]
+        start: Option<u64>,
+        #[arg(long)]
+        size: Option<u64>,
+    },
+    /// List system views for an object
+    #[command(after_help = "Example: intacct-cli view list accounts-payable/vendor")]
+    List {
+        /// Object path, e.g. accounts-payable/vendor
+        object: String,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ViewTypeArg {
+    System,
+    User,
+}
+
+impl ViewTypeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            ViewTypeArg::System => "system",
+            ViewTypeArg::User => "user",
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum FileTypeArg {
+    Pdf,
+    Csv,
+    Word,
+    Xml,
+    Xlsx,
+}
+
+impl FileTypeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            FileTypeArg::Pdf => "pdf",
+            FileTypeArg::Csv => "csv",
+            FileTypeArg::Word => "word",
+            FileTypeArg::Xml => "xml",
+            FileTypeArg::Xlsx => "xlsx",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum ReportAction {
+    /// Submit a stored/memorized report to run
+    #[command(after_help = "Example: intacct-cli report run 1 --output-type pdf")]
+    Run {
+        report_id: String,
+        #[arg(value_enum, long = "output-type")]
+        output_type: OutputTypeArg,
+        #[arg(value_enum, long = "output-location", default_value = "intacct")]
+        output_location: OutputLocationArg,
+    },
+    /// Check a report run's status
+    #[command(after_help = "Example: intacct-cli report status 1 --output-type pdf")]
+    Status {
+        report_id: String,
+        #[arg(value_enum, long = "output-type")]
+        output_type: OutputTypeArg,
+        #[arg(value_enum, long = "output-location", default_value = "intacct")]
+        output_location: OutputLocationArg,
+    },
+    /// Download a completed report's output to a file
+    #[command(
+        after_help = "Example: intacct-cli report download 1 --output-type pdf --output report.pdf"
+    )]
+    Download {
+        report_id: String,
+        #[arg(value_enum, long = "output-type")]
+        output_type: OutputTypeArg,
+        /// File path to write the downloaded binary to; refuses to overwrite an existing file
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Cancel a queued report run
+    #[command(after_help = "Example: intacct-cli report cancel 1 --output-type pdf")]
+    Cancel {
+        report_id: String,
+        #[arg(value_enum, long = "output-type")]
+        output_type: OutputTypeArg,
+        #[arg(value_enum, long = "output-location", default_value = "intacct")]
+        output_location: OutputLocationArg,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum OutputTypeArg {
+    Html,
+    Pdf,
+    Csv,
+    Excel,
+    Text,
+    Fec,
+    Zip,
+}
+
+impl OutputTypeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            OutputTypeArg::Html => "html",
+            OutputTypeArg::Pdf => "pdf",
+            OutputTypeArg::Csv => "csv",
+            OutputTypeArg::Excel => "excel",
+            OutputTypeArg::Text => "text",
+            OutputTypeArg::Fec => "fec",
+            OutputTypeArg::Zip => "zip",
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum OutputLocationArg {
+    Intacct,
+    Cloud,
+}
+
+impl OutputLocationArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            OutputLocationArg::Intacct => "intacct",
+            OutputLocationArg::Cloud => "cloud",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -375,37 +558,10 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
         Command::Object { action } => dispatch_object(cli, action).await,
         Command::Query {
             object,
-            fields,
-            filters,
-            filter_expression,
-            order_by,
-            start,
-            size,
+            query,
             all,
-            as_of_date,
-            case_sensitive,
-            include_private,
-            include_hierarchy_fields,
             body,
-        } => {
-            dispatch_query(
-                cli,
-                object,
-                fields,
-                filters,
-                filter_expression,
-                order_by,
-                *start,
-                *size,
-                *all,
-                as_of_date,
-                *case_sensitive,
-                *include_private,
-                *include_hierarchy_fields,
-                body,
-            )
-            .await
-        }
+        } => dispatch_query(cli, object, query, *all, body).await,
         Command::Describe {
             name,
             schema,
@@ -448,48 +604,134 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
             composite::session_id(&context.client).await
         }
+        Command::View { action } => dispatch_view(cli, action).await,
+        Command::Export {
+            object,
+            file_type,
+            output,
+            query,
+            body,
+        } => dispatch_export(cli, object, *file_type, output, query, body).await,
+        Command::Report { action } => dispatch_report(cli, action).await,
     }
 }
 
-/// Structured flags and `--body` are mutually exclusive: either give an object path with the
-/// structured flags, or a raw body (`--all` is the one flag that composes with both).
-#[allow(clippy::too_many_arguments)]
+async fn dispatch_view(cli: &Cli, action: &ViewAction) -> Result<serde_json::Value, CliError> {
+    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+    match action {
+        ViewAction::Run {
+            key,
+            view_type,
+            start,
+            size,
+        } => view::run(&context.client, key, view_type.as_str(), *start, *size).await,
+        ViewAction::List { object } => view::list_system_views(&context.client, object).await,
+    }
+}
+
+/// Structured flags and `--body` are mutually exclusive, mirroring `query`'s rule.
+async fn dispatch_export(
+    cli: &Cli,
+    object: &Option<String>,
+    file_type: FileTypeArg,
+    output: &std::path::Path,
+    query: &QueryFlags,
+    body: &Option<String>,
+) -> Result<serde_json::Value, CliError> {
+    let query_body = build_query_or_body(object, query, body)?;
+    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+    export::run(&context.client, file_type.as_str(), query_body, output).await
+}
+
+async fn dispatch_report(cli: &Cli, action: &ReportAction) -> Result<serde_json::Value, CliError> {
+    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+    match action {
+        ReportAction::Run {
+            report_id,
+            output_type,
+            output_location,
+        } => {
+            report::run(
+                &context.client,
+                report_id,
+                output_type.as_str(),
+                output_location.as_str(),
+            )
+            .await
+        }
+        ReportAction::Status {
+            report_id,
+            output_type,
+            output_location,
+        } => {
+            report::status(
+                &context.client,
+                report_id,
+                output_type.as_str(),
+                output_location.as_str(),
+            )
+            .await
+        }
+        ReportAction::Download {
+            report_id,
+            output_type,
+            output,
+        } => report::download(&context.client, report_id, output_type.as_str(), output).await,
+        ReportAction::Cancel {
+            report_id,
+            output_type,
+            output_location,
+        } => {
+            report::cancel(
+                &context.client,
+                report_id,
+                output_type.as_str(),
+                output_location.as_str(),
+            )
+            .await
+        }
+    }
+}
+
 async fn dispatch_query(
     cli: &Cli,
     object: &Option<String>,
-    fields: &Option<String>,
-    filters: &[String],
-    filter_expression: &Option<String>,
-    order_by: &[String],
-    start: Option<u64>,
-    size: Option<u64>,
+    query: &QueryFlags,
     all: bool,
-    as_of_date: &Option<String>,
-    case_sensitive: bool,
-    include_private: bool,
-    include_hierarchy_fields: bool,
+    body: &Option<String>,
+) -> Result<serde_json::Value, CliError> {
+    let request_body = build_query_or_body(object, query, body)?;
+    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+    query::run(&context.client, request_body, all).await
+}
+
+/// Shared by `query` and `export`: structured flags and `--body` are mutually exclusive,
+/// either give an object path with the structured flags, or a raw body.
+fn build_query_or_body(
+    object: &Option<String>,
+    query: &QueryFlags,
     body: &Option<String>,
 ) -> Result<serde_json::Value, CliError> {
     let structured_flags_set = object.is_some()
-        || fields.is_some()
-        || !filters.is_empty()
-        || filter_expression.is_some()
-        || !order_by.is_empty()
-        || start.is_some()
-        || size.is_some()
-        || as_of_date.is_some()
-        || case_sensitive
-        || include_private
-        || include_hierarchy_fields;
+        || query.fields.is_some()
+        || !query.filters.is_empty()
+        || query.filter_expression.is_some()
+        || !query.order_by.is_empty()
+        || query.start.is_some()
+        || query.size.is_some()
+        || query.as_of_date.is_some()
+        || query.case_sensitive
+        || query.include_private
+        || query.include_hierarchy_fields;
 
-    let request_body = match body {
+    match body {
         Some(raw_body) => {
             if structured_flags_set {
                 return Err(CliError::Usage(
                     "pass either --body or the structured flags, not both".into(),
                 ));
             }
-            commands::read_data_arg(raw_body)?
+            commands::read_data_arg(raw_body)
         }
         None => {
             let object = object.clone().ok_or_else(|| {
@@ -497,22 +739,19 @@ async fn dispatch_query(
             })?;
             query::build_query_body(&query::QueryArgs {
                 object,
-                fields: fields.clone(),
-                filters: filters.to_vec(),
-                filter_expression: filter_expression.clone(),
-                order_by: order_by.to_vec(),
-                start,
-                size,
-                as_of_date: as_of_date.clone(),
-                case_sensitive,
-                include_private,
-                include_hierarchy_fields,
-            })?
+                fields: query.fields.clone(),
+                filters: query.filters.clone(),
+                filter_expression: query.filter_expression.clone(),
+                order_by: query.order_by.clone(),
+                start: query.start,
+                size: query.size,
+                as_of_date: query.as_of_date.clone(),
+                case_sensitive: query.case_sensitive,
+                include_private: query.include_private,
+                include_hierarchy_fields: query.include_hierarchy_fields,
+            })
         }
-    };
-
-    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
-    query::run(&context.client, request_body, all).await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

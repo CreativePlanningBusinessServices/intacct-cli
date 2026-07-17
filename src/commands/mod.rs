@@ -1,16 +1,51 @@
 pub mod account;
 pub mod composite;
 pub mod describe;
+pub mod export;
 pub mod job;
 pub mod object;
 pub mod query;
 pub mod raw;
+pub mod report;
+pub mod view;
 
 use std::io::Read;
+use std::path::Path;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::client::BinaryResponse;
 use crate::error::CliError;
+
+/// Shared by `export` and `report download`: both endpoints return a binary file body and
+/// write it to `output_path`, refusing to clobber an existing file, with the same
+/// `{"written", "bytes", "contentType"}` result shape.
+pub fn write_binary_output(
+    output_path: &Path,
+    response: BinaryResponse,
+) -> Result<Value, CliError> {
+    std::fs::write(output_path, &response.bytes).map_err(|write_error| {
+        CliError::Usage(format!(
+            "cannot write {}: {write_error}",
+            output_path.display()
+        ))
+    })?;
+    Ok(json!({
+        "written": output_path.display().to_string(),
+        "bytes": response.bytes.len(),
+        "contentType": response.content_type,
+    }))
+}
+
+pub fn refuse_existing_output(output_path: &Path) -> Result<(), CliError> {
+    if output_path.exists() {
+        return Err(CliError::Usage(format!(
+            "output file already exists: {}",
+            output_path.display()
+        )));
+    }
+    Ok(())
+}
 
 pub fn read_data_arg(raw: &str) -> Result<Value, CliError> {
     let text = if raw == "-" {

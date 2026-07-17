@@ -105,6 +105,50 @@ async fn intacct_error_body_maps_to_api_error_with_support_id() {
     }
 }
 
+#[tokio::test]
+async fn request_binary_maps_error_bodies() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/reports/download"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "ia::error": {
+                "code": "operationFailed",
+                "message": "Operation create object HQemployee failed",
+                "supportId": "sojLj~X2",
+                "details": [{"code": "BL01001973", "message": "Employee Contact info cannot be empty"}]
+            }
+        })))
+        .mount(&server)
+        .await;
+    let client = common::client_for(&server);
+    let error = client
+        .request_binary(
+            reqwest::Method::GET,
+            "/services/reports/download",
+            &[],
+            None,
+        )
+        .await
+        .unwrap_err();
+    match error {
+        CliError::Api {
+            status,
+            message,
+            details,
+            support_id,
+        } => {
+            assert_eq!(status, 422);
+            assert_eq!(
+                message,
+                "operationFailed: Operation create object HQemployee failed"
+            );
+            assert_eq!(details.len(), 1);
+            assert_eq!(support_id.as_deref(), Some("sojLj~X2"));
+        }
+        other => panic!("wrong error: {other:?}"),
+    }
+}
+
 struct CountingTokens(AtomicU32);
 impl TokenProvider for CountingTokens {
     fn access_token<'life>(

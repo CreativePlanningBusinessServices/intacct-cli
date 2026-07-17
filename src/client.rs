@@ -23,6 +23,14 @@ pub struct IaResponse {
     pub location: Option<String>,
 }
 
+/// For endpoints whose success body is a file (export, report download), not JSON.
+#[derive(Debug)]
+pub struct BinaryResponse {
+    pub status: u16,
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
 impl IaClient {
     pub fn new(
         http: reqwest::Client,
@@ -71,19 +79,79 @@ impl IaClient {
     ) -> Result<IaResponse, CliError> {
         let url = resolve_url(&self.base, path);
         let build_request = || self.http.post(&url).multipart(build_form());
-        self.execute_with_retry(&url, &build_request).await
+        let response = self.send_with_retry(&url, &build_request).await?;
+        parse_json_response(&url, response).await
+    }
+
+    /// For endpoints whose success body is a file (export, report download). Shares the
+    /// same auth/retry loop as `request`; only the success-path body handling differs
+    /// (raw bytes instead of parsed JSON). On non-2xx the body is still read as text and
+    /// parsed as JSON, mapped through the same `api_error()` as `request`.
+    pub async fn request_binary(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<BinaryResponse, CliError> {
+        let url = resolve_url(&self.base, path);
+        let build_request = || {
+            let mut request = self.http.request(method.clone(), &url).query(query);
+            if let Some(json_body) = body {
+                request = request.json(json_body);
+            }
+            request
+        };
+        let response = self.send_with_retry(&url, &build_request).await?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+
+        if status.is_success() {
+            let bytes = response.bytes().await.map_err(|read_error| {
+                CliError::Network(format!("reading response from {url} failed: {read_error}"))
+            })?;
+            return Ok(BinaryResponse {
+                status: status.as_u16(),
+                bytes: bytes.to_vec(),
+                content_type,
+            });
+        }
+
+        let raw = response.text().await.map_err(|read_error| {
+            CliError::Network(format!("reading response from {url} failed: {read_error}"))
+        })?;
+        let parsed: Option<Value> = if raw.trim().is_empty() {
+            None
+        } else {
+            serde_json::from_str(&raw).ok()
+        };
+        Err(api_error(status.as_u16(), parsed, raw))
     }
 
     /// Owns the shared per-attempt control flow: 401 invalidate-and-retry-once,
-    /// 429/5xx Retry-After/backoff, response parsing, and success/error dispatch.
-    /// `build_request` produces a fresh, unauthenticated `RequestBuilder` for each
-    /// attempt (method/url/query/body already applied); this helper adds bearer
-    /// auth and the entity header before sending.
+    /// 429/5xx Retry-After/backoff. `build_request` produces a fresh, unauthenticated
+    /// `RequestBuilder` for each attempt (method/url/query/body already applied); this
+    /// helper adds bearer auth and the entity header before sending. Returns the final
+    /// `reqwest::Response` (success or exhausted-retries error) for the caller to read the
+    /// body from — as JSON (`request`/`request_multipart`) or raw bytes (`request_binary`).
     async fn execute_with_retry(
         &self,
         url: &str,
         build_request: &(dyn Fn() -> reqwest::RequestBuilder + Send + Sync),
     ) -> Result<IaResponse, CliError> {
+        let response = self.send_with_retry(url, build_request).await?;
+        parse_json_response(url, response).await
+    }
+
+    async fn send_with_retry(
+        &self,
+        url: &str,
+        build_request: &(dyn Fn() -> reqwest::RequestBuilder + Send + Sync),
+    ) -> Result<reqwest::Response, CliError> {
         let mut reauthorized = false;
         let mut attempt = 0;
         loop {
@@ -114,30 +182,38 @@ impl IaClient {
                 continue;
             }
 
-            let location = response
-                .headers()
-                .get("location")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let raw = response.text().await.map_err(|read_error| {
-                CliError::Network(format!("reading response from {url} failed: {read_error}"))
-            })?;
-            let parsed: Option<Value> = if raw.trim().is_empty() {
-                None
-            } else {
-                serde_json::from_str(&raw).ok()
-            };
-
-            if status.is_success() {
-                return Ok(IaResponse {
-                    status: status.as_u16(),
-                    body: parsed,
-                    location,
-                });
-            }
-            return Err(api_error(status.as_u16(), parsed, raw));
+            return Ok(response);
         }
     }
+}
+
+async fn parse_json_response(
+    url: &str,
+    response: reqwest::Response,
+) -> Result<IaResponse, CliError> {
+    let status = response.status();
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let raw = response.text().await.map_err(|read_error| {
+        CliError::Network(format!("reading response from {url} failed: {read_error}"))
+    })?;
+    let parsed: Option<Value> = if raw.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str(&raw).ok()
+    };
+
+    if status.is_success() {
+        return Ok(IaResponse {
+            status: status.as_u16(),
+            body: parsed,
+            location,
+        });
+    }
+    Err(api_error(status.as_u16(), parsed, raw))
 }
 
 fn resolve_url(base: &str, path: &str) -> String {
