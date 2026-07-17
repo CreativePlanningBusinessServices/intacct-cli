@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>intacct-cli — Design Spec (2026-07-16)</title>
+<style>
+  :root {
+    --ink: #1a2233;
+    --muted: #5b6575;
+    --accent: #0a7d4f;
+    --accent-soft: #e6f4ee;
+    --border: #d9dee7;
+    --code-bg: #f4f6f9;
+    --warn-bg: #fff7e6;
+    --warn-border: #e6c25a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    line-height: 1.55;
+    max-width: 60rem;
+    margin: 0 auto;
+    padding: 2.5rem 1.5rem 5rem;
+    background: #fff;
+  }
+  h1 { font-size: 1.9rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.35rem; margin-top: 2.5rem; border-bottom: 2px solid var(--accent-soft); padding-bottom: 0.3rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.6rem; }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.86em;
+  }
+  code { background: var(--code-bg); padding: 0.12em 0.35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.9rem 1.1rem;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.93rem; }
+  th, td { border: 1px solid var(--border); padding: 0.45rem 0.65rem; text-align: left; vertical-align: top; }
+  th { background: var(--accent-soft); }
+  .callout {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 8px;
+    padding: 0.8rem 1.1rem;
+    margin: 1rem 0;
+  }
+  .decision-panel {
+    background: var(--accent-soft);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    padding: 1.1rem 1.3rem;
+    margin: 1.6rem 0;
+  }
+  .decision-panel h3 { margin-top: 0; }
+  .btn {
+    display: inline-block;
+    margin: 0.35rem 0.5rem 0.35rem 0;
+    padding: 0.55rem 1.1rem;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: 600;
+    border: 1px solid var(--accent);
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-secondary { background: #fff; color: var(--accent); }
+  .muted { color: var(--muted); }
+  ul { padding-left: 1.3rem; }
+  li { margin: 0.25rem 0; }
+</style>
+</head>
+<body>
+
+<h1>intacct-cli — Design Spec</h1>
+<p class="subtitle">2026-07-16 · Rust CLI wrapping the modern Sage Intacct REST API · Basecamp todo
+<a href="https://basecamp.com/2808802/projects/8218129/todos/518814675">518814675</a></p>
+
+<div class="decision-panel">
+  <h3>Decision: is this spec approved?</h3>
+  <p>Approving moves us to the implementation plan (writing-plans skill). Buttons repeat at the bottom.</p>
+  <a class="btn btn-primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve+spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="btn btn-secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request+changes" target="_blank">I have changes — I'll describe them in chat</a>
+</div>
+
+<h2>1. Overview &amp; goals</h2>
+<p><code>intacct-cli</code> is a single-binary Rust CLI for AI agents (and humans) wrapping the <strong>modern
+Sage Intacct REST API</strong> (<code>https://api.intacct.com/ia/api/v1</code>, GA since Intacct 2025 R1).
+It is modeled closely on <code>netsuite-cli</code>: JSON-only stdout, structured JSON errors on stderr,
+deterministic exit codes, multi-account OAuth with OS-keyring secret storage, an embedded agent-facing
+skill, and self-update from GitHub releases.</p>
+
+<p><strong>Non-goals:</strong> the legacy XML API (explicitly out of scope; the <code>session-id</code>
+command exists only as Sage's documented escape hatch), per-object typed subcommands / OpenAPI codegen,
+table/human output formats, SOAP (Intacct has none).</p>
+
+<p><strong>Architecture decision (approved):</strong> generic commands over Intacct's platform endpoints.
+Objects are addressed by API path (<code>accounts-payable/vendor</code>), so all ~18 application groups,
+document-type objects (<code>order-entry/document::Contract Invoice</code>), and custom objects
+(<code>platform-apps/nsp::my-object</code>) work through one <code>object</code> command with zero
+per-object code. Schema discovery happens at runtime via the model service (<code>describe</code>).
+This mirrors netsuite-cli's generic <code>record</code> command and is immune to Sage's quarterly
+object additions. OpenAPI codegen was considered and rejected (spec is Cloudflare-gated, enormous
+generated surface, goes stale between releases, custom objects need the generic path anyway).</p>
+
+<h2>2. Crate layout</h2>
+<p>Mirrors netsuite-cli. <code>main.rs</code> is a 4-line <code>#[tokio::main]</code> shim calling
+<code>intacct_cli::cli::cli_main()</code>; all logic lives in the library so integration tests call
+command functions directly.</p>
+
+<table>
+<tr><th>Module</th><th>Purpose</th></tr>
+<tr><td><code>cli.rs</code></td><td>clap derive definitions, dispatch, centralized stdout/stderr + exit-code emission</td></tr>
+<tr><td><code>client.rs</code></td><td><code>IaClient</code>: reqwest wrapper, retries, token invalidation, envelope-aware error extraction</td></tr>
+<tr><td><code>config.rs</code></td><td>TOML config load/save, alias resolution</td></tr>
+<tr><td><code>context.rs</code></td><td><code>context_for(alias)</code> → resolved <code>AccountContext</code> (alias, company, entity, client)</td></tr>
+<tr><td><code>error.rs</code></td><td><code>CliError</code> enum, exit-code mapping, JSON serialization</td></tr>
+<tr><td><code>output.rs</code></td><td><code>print_json</code> / <code>print_error</code></td></tr>
+<tr><td><code>secrets.rs</code></td><td><code>SecretStore</code> trait; <code>KeyringStore</code> (prod) + <code>MemoryStore</code> (tests)</td></tr>
+<tr><td><code>account.rs</code></td><td>Username/tenant formatting (<code>userId@companyId|entityId</code>), base-URL resolution (env-overridable for tests)</td></tr>
+<tr><td><code>auth/</code></td><td><code>mod.rs</code> (<code>TokenProvider</code> trait, <code>CachedToken</code>), <code>client_credentials.rs</code>, <code>authcode.rs</code>, <code>loopback.rs</code></td></tr>
+<tr><td><code>commands/</code></td><td>One module per subcommand family (see §3)</td></tr>
+</table>
+
+<p>Every command handler returns <code>Result&lt;serde_json::Value, CliError&gt;</code>. Success →
+one JSON value on stdout, exit 0. Error → JSON error object on stderr, mapped exit code.</p>
+
+<h2>3. Command surface</h2>
+
+<p><strong>Global flags:</strong> <code>--account &lt;alias&gt;</code> (fallback
+<code>$INTACCT_ACCOUNT</code>, then configured default) · <code>--entity &lt;id&gt;</code>
+(sets <code>X-IA-API-Param-Entity</code>, overrides the account's default entity) ·
+<code>--pretty</code>. Clap config: <code>color = Never</code>, <code>propagate_version</code>,
+copy-paste-correct <code>after_help</code> examples on every subcommand.</p>
+
+<table>
+<tr><th>Command</th><th>Shape</th></tr>
+<tr><td><code>account add</code></td><td><code>add &lt;alias&gt; --company-id &lt;C&gt; --flow &lt;client-credentials|auth-code&gt; --client-id &lt;ID&gt; [--user-id &lt;U&gt;] [--entity-id &lt;E&gt;] [--port 8899] [--paste]</code>. Client secret via hidden prompt or <code>$INTACCT_CLI_CLIENT_SECRET</code> — never a flag. <code>--user-id</code> required for client-credentials. First account added becomes default.</td></tr>
+<tr><td><code>account list / set-default / remove / test / revoke</code></td><td><code>list</code> never prints secrets. <code>remove</code> sweeps config entry + all keyring entries. <code>test</code> verifies creds against the model service (<code>--reauth</code> re-runs browser login for auth-code). <code>revoke</code> calls <code>POST /oauth2/revoke</code> with a loud confirmation — Intacct revokes <em>all</em> tokens for that user/company.</td></tr>
+<tr><td><code>object get</code></td><td><code>get &lt;application/object&gt; &lt;key[,key…]&gt;</code> → <code>GET /objects/{path}/{keys}</code></td></tr>
+<tr><td><code>object list</code></td><td><code>list &lt;application/object&gt; [--start N] [--size N] [--all]</code> → unkeyed <code>GET /objects/{path}</code>; returns key/id/href-level rows; follows <code>ia::meta.next</code>. For field selection or filtering, use <code>query</code>.</td></tr>
+<tr><td><code>object create</code></td><td><code>create &lt;application/object&gt; --data &lt;json|@file|-&gt;</code>. JSON array = batch (≤500). <code>--atomic</code> → <code>X-IA-API-Param-Transaction: true</code>. <code>--idempotency-key &lt;uuid&gt;</code> supported here and on <code>update</code> (Intacct honors the header on POST/PATCH only).</td></tr>
+<tr><td><code>object update</code></td><td><code>update &lt;application/object&gt; [&lt;key&gt;] --data …</code> → <code>PATCH</code>. Single: key in path. Batch: array body with <code>key</code> per element, no path key.</td></tr>
+<tr><td><code>object delete</code></td><td><code>delete &lt;application/object&gt; &lt;key[,key…]&gt;</code> → 204; CLI emits <code>{"deleted": true, "keys": […]}</code></td></tr>
+<tr><td><code>query</code></td><td><code>query &lt;application/object&gt; --fields k,id,vendor.id [--filter '{"$eq":{"status":"active"}}']… [--filter-expression "(1 and 2)"] [--order-by '{"id":"asc"}']… [--start N] [--size N≤4000] [--all] [--as-of-date D] [--case-sensitive] [--include-private]</code> → <code>POST /services/core/query</code>. <code>--body &lt;json&gt;</code> bypasses the flags for a raw query body. Aggregates via field prefixes (<code>sum:</code>, <code>count:</code>…).</td></tr>
+<tr><td><code>describe</code></td><td><code>describe &lt;application/object&gt; [--schema] [--refresh]</code> or <code>describe --list [--type object|service|workflow] [--filter &lt;regex&gt;]</code> → <code>GET /services/core/model</code>. Responses cached under the ProjectDirs cache dir per alias with <code>cache_ttl_hours</code>.</td></tr>
+<tr><td><code>job submit / status / result</code></td><td>Bulk service: <code>submit &lt;application/object&gt; &lt;create|update|delete&gt; --data @file [--callback-url U]</code> → multipart <code>POST /services/bulk/job/create</code>; <code>status &lt;jobId&gt;</code>; <code>result &lt;jobId&gt;</code> (= status with <code>download=true</code>).</td></tr>
+<tr><td><code>composite</code></td><td><code>composite --data &lt;json&gt;</code> → <code>POST /services/core/composite</code> (array of <code>{method, path, body?}</code> sub-requests).</td></tr>
+<tr><td><code>view / export / schedule / report</code></td><td>Dedicated wrappers for the remaining core services (run views, filtered exports, schedules, run/monitor reports). Exact arg shapes finalized from the captured Sage docs + OpenAPI reference during implementation planning; each is a thin verb-per-endpoint wrapper in the same style as <code>job</code>.</td></tr>
+<tr><td><code>session-id</code></td><td>Mint a legacy XML-API session ID from the current Bearer token (documented escape hatch).</td></tr>
+<tr><td><code>raw</code></td><td><code>raw &lt;METHOD&gt; &lt;path&gt; [--query k=v]… [--header 'Name: value']… [--data …]</code>. METHOD ∈ GET/POST/PUT/PATCH/DELETE. Nothing is ever blocked on a missing command.</td></tr>
+<tr><td><code>config get / set</code></td><td>Settable keys: <code>default_account</code> (validated), <code>cache_ttl_hours</code> (u64, default 24).</td></tr>
+<tr><td><code>skill install</code></td><td>Write embedded SKILL.md to <code>$CLAUDE_CONFIG_DIR|~/.claude/skills/intacct-cli/</code>; skip if symlinked (dev checkout) or already current.</td></tr>
+<tr><td><code>update</code></td><td>Self-update from GitHub releases (<code>--check</code>, <code>--no-skill</code>); re-execs new binary's <code>skill install</code>.</td></tr>
+</table>
+
+<p><strong>Deliberately absent</strong> vs netsuite-cli: <code>suiteql</code> (query service replaces it),
+<code>restlet</code>, <code>saved-search</code>/SOAP, <code>system</code> (no Intacct REST equivalents).</p>
+
+<h2>4. Auth</h2>
+
+<h3>Client-credentials (agent default)</h3>
+<p><code>POST /oauth2/token</code> with <code>grant_type=client_credentials</code>,
+<code>client_id</code>, <code>client_secret</code>, <code>username</code>. Tenant selection is embedded
+in the username: <code>userId@companyId</code>, entity-scoped as <code>userId@companyId|entityId</code>.
+Prereqs (admin, once per company): a Web Services user, and the app's client ID authorized under
+Company → Security → Authorized Client Applications. Access token (~8–12h; <code>expires_in</code> is
+authoritative) cached in keyring with 60s leeway.</p>
+
+<h3>Auth-code + PKCE (interactive users)</h3>
+<p>Browser consent at <code>GET /oauth2/authorize</code> (<code>response_type=code</code>, S256 PKCE,
+<code>state</code>, <code>scope=offline_access</code> to obtain a refresh token). Redirect caught by a
+one-shot loopback HTTPS listener on <code>127.0.0.1:&lt;port&gt;</code> (throwaway self-signed cert,
+30s read / 300s overall timeouts, <code>/callback</code> only, no query-value echo) or
+<code>--paste</code> stdin fallback — ported from netsuite-cli. <strong>Intacct difference:</strong>
+refresh (<code>grant_type=refresh_token</code>) requires the <code>client_secret</code> — not a public
+client — so the secret is stored for auth-code accounts too. Rotated refresh tokens are persisted
+before first use, with netsuite-cli's rotation-failure handling (self-describing errors pointing at
+<code>account add</code> re-run).</p>
+
+<h3>Token plumbing</h3>
+<p><code>TokenProvider</code> trait (object-safe, <code>access_token()</code> +
+<code>invalidate()</code>), <code>CachedToken { access_token, expires_at_epoch }</code> in keyring under
+<code>&lt;alias&gt;#token</code>. On HTTP 401 the client invalidates and retries once.</p>
+
+<h2>5. Config &amp; secrets</h2>
+
+<pre><code># ~/Library/Application Support/com.CreativePlanning.intacct-cli/config.toml
+default_account = "prod"
+cache_ttl_hours = 24
+
+[accounts.prod]
+company_id = "creativeplanning"
+user_id = "svc_api"          # client-credentials only
+entity_id = "CentralUS-35"   # optional default entity scope
+flow = "client-credentials"  # or "auth-code"
+</code></pre>
+
+<p>Alias resolution: <code>--account</code> flag → <code>$INTACCT_ACCOUNT</code> →
+<code>default_account</code>; unknown/unset → usage error (exit 2). Config writes precede keyring
+writes so a keychain failure leaves a re-runnable state.</p>
+
+<p>Keyring (service <code>intacct-cli</code>; values JSON; no plaintext fallback):</p>
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td><code>&lt;alias&gt;</code></td><td>Tagged enum: <code>client-credentials { client_id, client_secret, username }</code> · <code>auth-code { client_id, client_secret, refresh_token }</code></td></tr>
+<tr><td><code>&lt;alias&gt;#token</code></td><td><code>CachedToken</code></td></tr>
+</table>
+
+<h2>6. HTTP client &amp; error model</h2>
+
+<p><code>IaClient</code>: reqwest (rustls, no default features), base
+<code>https://api.intacct.com/ia/api/v1</code> (env-overridable for wiremock), retry loop
+<code>MAX_ATTEMPTS = 4</code>, base backoff 500ms. 401 → invalidate + retry once; 429/5xx → honor
+<code>Retry-After</code> else exponential backoff. Success codes: 200/201/202/204/207. Successful
+bodies pass through unmodified (agents see documented <code>ia::result</code>/<code>ia::meta</code>
+shapes); 204 is synthesized into a small JSON acknowledgment.</p>
+
+<table>
+<tr><th>CliError variant</th><th>Exit</th><th>kind</th><th>Notes</th></tr>
+<tr><td><code>Api { status, message, details, support_id }</code></td><td>1</td><td><code>api</code></td><td>From <code>ia::error</code>: <code>code</code>+<code>message</code> → message; <code>details[]</code> verbatim; <code>supportId</code> top-level (Sage's correlation ID). Gateway <code>GW-00xx</code> errors map identically.</td></tr>
+<tr><td><code>Usage(String)</code></td><td>2</td><td><code>usage</code></td><td>Includes folded clap errors; <code>--help</code>/<code>--version</code> exempt (human text, exit 0)</td></tr>
+<tr><td><code>Auth(String)</code></td><td>3</td><td><code>auth</code></td><td>Token acquisition/refresh failures, keychain unavailable</td></tr>
+<tr><td><code>Network(String)</code></td><td>4</td><td><code>network</code></td><td>Transport-level failures after retries</td></tr>
+</table>
+
+<h2>7. Output conventions</h2>
+<ul>
+<li>stdout: exactly one JSON value per invocation; compact by default, <code>--pretty</code> to indent.</li>
+<li>stderr: everything else — JSON error objects, prompts, browser URLs, warnings.</li>
+<li><code>--all</code> pagination merges pages into <code>{items, count, totalCount, hasMore}</code>,
+following <code>ia::meta.next</code> (query pages ≤4,000 rows), with a 1,000-page defensive cap and a
+misbehaving-server guard (stop if a page claims more but returns nothing).</li>
+</ul>
+
+<h2>8. Testing</h2>
+<ul>
+<li><strong>Integration:</strong> wiremock per command family; tests call library command functions with
+an <code>IaClient</code> pointed at the mock server, <code>StaticToken</code> provider, and
+<code>MemoryStore</code> secrets. Failure-mode doubles (<code>FailingSecretStore</code>) prove
+write-ordering invariants.</li>
+<li><strong>Unit:</strong> inline <code>#[cfg(test)]</code> — PKCE vectors, username/tenant formatting,
+error-body mapping, pagination merging.</li>
+<li><strong>Live smoke:</strong> <code>tests/live_smoke.rs</code>, all <code>#[ignore]</code>d, gated on
+<code>INTACCT_LIVE_ALIAS</code>; becomes runnable once the Sage developer app is registered (we have a
+company; app registration is pending — mock-first is the plan).</li>
+</ul>
+
+<h2>9. CI, release &amp; distribution</h2>
+<ul>
+<li>CI: macos/windows/ubuntu matrix running <code>cargo test --locked</code>; lint job with
+<code>cargo fmt --check</code> + <code>clippy --all-targets -- -D warnings</code>.</li>
+<li>Release on <code>v*</code> tags: aarch64-apple-darwin, x86_64-apple-darwin,
+x86_64-pc-windows-msvc zips via <code>softprops/action-gh-release</code>.</li>
+<li><code>update</code>: <code>self_update</code> crate against
+<code>CreativePlanningBusinessServices/intacct-cli</code> (private → <code>GITHUB_TOKEN</code>);
+after swap, re-exec new binary's <code>skill install</code>.</li>
+<li><code>.gitattributes</code> enforces LF (embedded SKILL.md on Windows checkouts).</li>
+</ul>
+
+<h2>10. Agent skill</h2>
+<p><code>skills/intacct-cli/SKILL.md</code>, embedded via <code>include_str!</code>. Contents: decision
+table (need → command), once-per-machine bootstrap, recipes (describe-before-writing; query paging with
+<code>--all</code>; batch + <code>--atomic</code>; bulk jobs for &gt;500 records; entity scoping via
+<code>--entity</code>; idempotency keys on writes), exit-code → action table, gotchas (stdout is one
+JSON value; <code>ia::</code> envelope shapes; <code>account revoke</code> kills all tokens for the
+user/company; 4,000-row query pages; 1&nbsp;MB request bodies; username format carries the tenant).</p>
+
+<h2>11. Build order</h2>
+<ol>
+<li>Foundations: <code>error.rs</code>, <code>output.rs</code>, <code>config.rs</code>, <code>secrets.rs</code></li>
+<li><code>client.rs</code> + client-credentials auth + <code>context.rs</code></li>
+<li><code>account</code> commands (add/list/set-default/remove/test)</li>
+<li><code>object</code> CRUD + <code>query</code> + <code>describe</code></li>
+<li><code>raw</code> + auth-code/PKCE flow (loopback listener) + <code>account revoke</code></li>
+<li>Services: <code>job</code>, <code>composite</code>, <code>view</code>, <code>export</code>,
+<code>schedule</code>, <code>report</code>, <code>session-id</code></li>
+<li><code>skill</code> + <code>update</code> + CI/release workflows</li>
+</ol>
+
+<h2>12. Reference material</h2>
+<ul>
+<li>Design reference: <code>~/projects/creativeplanning/netsuite-cli</code> (module layout, auth plumbing, test patterns ported directly).</li>
+<li>API docs: <a href="https://developer.sage.com/intacct/docs/">developer.sage.com/intacct/docs</a> — Cloudflare-gated to plain fetches; key pages (OAuth2, query service, bulk, error handling, model service, owned objects, rate tiers) were captured during research and inform §3–§7.</li>
+<li>OpenAPI reference: <a href="https://developer.sage.com/intacct/apis/intacct/1/intacct-openapi">intacct-openapi</a> (18 application groups; downloadable full spec exists but requires an interactive browser session — vendor manually if ever needed).</li>
+<li>Rate behavior: monthly transaction tiers bill overage rather than block; concurrency breaches → 429/<code>GW-0010</code>. CLI honors 429 backoff and issues requests serially.</li>
+</ul>
+
+<div class="decision-panel">
+  <h3>Decision: is this spec approved?</h3>
+  <a class="btn btn-primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve+spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="btn btn-secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request+changes" target="_blank">I have changes — I'll describe them in chat</a>
+</div>
+
+</body>
+</html>
