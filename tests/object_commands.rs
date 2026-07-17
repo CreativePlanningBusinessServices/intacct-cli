@@ -2,7 +2,7 @@ mod common;
 
 use intacct_cli::commands::object;
 use serde_json::json;
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, header, method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -119,4 +119,50 @@ async fn list_all_merges_pages_following_next() {
     assert_eq!(result["hasMore"], false);
     assert_eq!(result["totalCount"], 3);
     assert_eq!(result["items"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn list_all_follows_string_next_url_without_reappending_params() {
+    let server = MockServer::start().await;
+    let next_url = format!(
+        "{}/objects/general-ledger/account?start=3&size=2",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path("/objects/general-ledger/account"))
+        .and(query_param("size", "2"))
+        .and(query_param_is_missing("start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ia::result": [{"key": "1"}, {"key": "2"}],
+            "ia::meta": {"totalCount": 3, "start": 1, "pageSize": 2, "next": next_url, "previous": null}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/objects/general-ledger/account"))
+        .and(query_param("start", "3"))
+        .and(query_param("size", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ia::result": [{"key": "3"}],
+            "ia::meta": {"totalCount": 3, "start": 3, "pageSize": 2, "next": null, "previous": 1}
+        })))
+        .mount(&server)
+        .await;
+    let result = object::list(
+        &common::client_for(&server),
+        "general-ledger/account",
+        None,
+        Some(2),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["count"], 3);
+    assert_eq!(result["hasMore"], false);
+    assert_eq!(result["items"].as_array().unwrap().len(), 3);
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2);
+    let second_request_query = received[1].url.query().unwrap_or("");
+    assert_eq!(second_request_query, "start=3&size=2");
 }

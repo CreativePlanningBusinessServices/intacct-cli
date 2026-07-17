@@ -31,16 +31,22 @@ pub async fn list(
     let mut pages_fetched: u32 = 0;
     let mut next_url: Option<String> = None;
     loop {
-        let mut query: Vec<(&str, String)> = Vec::new();
-        if let Some(start_row) = next_start {
-            query.push(("start", start_row.to_string()));
-        }
-        if let Some(page_size) = size {
-            query.push(("size", page_size.to_string()));
-        }
-        let path = next_url
-            .take()
-            .unwrap_or_else(|| format!("/objects/{object_path}"));
+        // A URL-style `next` encodes its own pagination and must be followed
+        // as-is; `start`/`size` are only appended for requests to the base
+        // `/objects/{object_path}` path.
+        let (path, query): (String, Vec<(&str, String)>) = match next_url.take() {
+            Some(url) => (url, Vec::new()),
+            None => {
+                let mut query: Vec<(&str, String)> = Vec::new();
+                if let Some(start_row) = next_start {
+                    query.push(("start", start_row.to_string()));
+                }
+                if let Some(page_size) = size {
+                    query.push(("size", page_size.to_string()));
+                }
+                (format!("/objects/{object_path}"), query)
+            }
+        };
         let response = client
             .request(reqwest::Method::GET, &path, &query, &[], None)
             .await?;
