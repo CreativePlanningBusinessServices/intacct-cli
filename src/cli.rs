@@ -5,7 +5,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::commands::{
-    self, account, composite, describe, export, job, object, query, raw, report, view,
+    self, account, composite, config_cmd, describe, export, job, object, query, raw, report, view,
 };
 use crate::config::AuthFlow;
 use crate::context::context_for;
@@ -41,6 +41,11 @@ pub enum Command {
     Account {
         #[command(subcommand)]
         action: AccountAction,
+    },
+    /// Get or set configuration values
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
     /// Generic CRUD against any Intacct REST object (application/object,
     /// application/document::Type, or platform-apps/nsp::name)
@@ -455,6 +460,23 @@ impl JobOperation {
 }
 
 #[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Get one or all configuration values
+    #[command(
+        after_help = "Examples:\n  intacct-cli config get\n  intacct-cli config get default_account"
+    )]
+    Get {
+        /// Configuration key to retrieve; omit to get all values
+        key: Option<String>,
+    },
+    /// Set a configuration value
+    #[command(
+        after_help = "Examples:\n  intacct-cli config set default_account prod\n  intacct-cli config set cache_ttl_hours 48"
+    )]
+    Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
 pub enum AccountAction {
     /// Add or overwrite an account alias; the first account added becomes the default
     #[command(
@@ -555,6 +577,7 @@ fn handle_clap_error(clap_error: &clap::Error) -> i32 {
 async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
     match &cli.command {
         Command::Account { action } => dispatch_account(cli, action).await,
+        Command::Config { action } => dispatch_config(action),
         Command::Object { action } => dispatch_object(cli, action).await,
         Command::Query {
             object,
@@ -859,6 +882,14 @@ async fn dispatch_job(cli: &Cli, action: &JobAction) -> Result<serde_json::Value
         }
         JobAction::Status { job_id } => job::status(&context.client, job_id, false).await,
         JobAction::Result { job_id } => job::status(&context.client, job_id, true).await,
+    }
+}
+
+fn dispatch_config(action: &ConfigAction) -> Result<serde_json::Value, CliError> {
+    let config_path = crate::config::default_config_path();
+    match action {
+        ConfigAction::Get { key } => config_cmd::get(&config_path, key.as_deref()),
+        ConfigAction::Set { key, value } => config_cmd::set(&config_path, key, value),
     }
 }
 

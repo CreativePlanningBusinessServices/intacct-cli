@@ -1,5 +1,6 @@
 pub mod account;
 pub mod composite;
+pub mod config_cmd;
 pub mod describe;
 pub mod export;
 pub mod job;
