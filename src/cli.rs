@@ -5,7 +5,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::commands::{
-    self, account, composite, config_cmd, describe, export, job, object, query, raw, report, view,
+    self, account, composite, config_cmd, describe, export, job, object, query, raw, report, skill,
+    view,
 };
 use crate::config::AuthFlow;
 use crate::context::context_for;
@@ -156,6 +157,24 @@ pub enum Command {
     Report {
         #[command(subcommand)]
         action: ReportAction,
+    },
+    /// Install or refresh the bundled agent skill (SKILL.md) into your Claude skills dir
+    #[command(
+        after_help = "Examples:\n  intacct-cli skill install\n  intacct-cli skill install --dir ~/.config/claude/skills/intacct-cli"
+    )]
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SkillAction {
+    /// Write the embedded SKILL.md to your Claude skills dir (skips a symlinked/repo-tracked copy)
+    Install {
+        /// Target dir (default: $CLAUDE_CONFIG_DIR or ~/.claude, under skills/intacct-cli)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
     },
 }
 
@@ -636,6 +655,9 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             body,
         } => dispatch_export(cli, object, *file_type, output, query, body).await,
         Command::Report { action } => dispatch_report(cli, action).await,
+        Command::Skill { action } => match action {
+            SkillAction::Install { dir } => skill::install(dir.as_deref()),
+        },
     }
 }
 

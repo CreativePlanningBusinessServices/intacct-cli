@@ -8,6 +8,7 @@ pub mod object;
 pub mod query;
 pub mod raw;
 pub mod report;
+pub mod skill;
 pub mod view;
 
 use std::io::Read;
