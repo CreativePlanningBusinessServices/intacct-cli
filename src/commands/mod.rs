@@ -2,6 +2,7 @@ pub mod account;
 pub mod describe;
 pub mod object;
 pub mod query;
+pub mod raw;
 
 use std::io::Read;
 

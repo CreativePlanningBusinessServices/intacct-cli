@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{self, account, describe, object, query};
+use crate::commands::{self, account, describe, object, query, raw};
 use crate::config::AuthFlow;
 use crate::context::context_for;
 use crate::error::CliError;
@@ -106,6 +106,23 @@ pub enum Command {
         #[arg(long, requires = "list")]
         filter: Option<String>,
     },
+    /// Send an arbitrary request to any Intacct REST endpoint
+    #[command(
+        after_help = "Example: intacct-cli raw GET /services/core/model --query type=service"
+    )]
+    Raw {
+        #[arg(value_enum, ignore_case = true)]
+        method: HttpMethodArg,
+        path: String,
+        /// Repeatable key=value query parameter
+        #[arg(long = "query")]
+        query: Vec<String>,
+        /// Repeatable 'Name: value' header
+        #[arg(long = "header")]
+        header: Vec<String>,
+        #[arg(long)]
+        data: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -121,6 +138,27 @@ impl ResourceType {
             ResourceType::Object => "object",
             ResourceType::Service => "service",
             ResourceType::Workflow => "workflow",
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum HttpMethodArg {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl HttpMethodArg {
+    fn to_method(self) -> reqwest::Method {
+        match self {
+            HttpMethodArg::Get => reqwest::Method::GET,
+            HttpMethodArg::Post => reqwest::Method::POST,
+            HttpMethodArg::Put => reqwest::Method::PUT,
+            HttpMethodArg::Patch => reqwest::Method::PATCH,
+            HttpMethodArg::Delete => reqwest::Method::DELETE,
         }
     }
 }
@@ -292,6 +330,30 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             r#type,
             filter,
         } => dispatch_describe(cli, name, *schema, *refresh, *list, *r#type, filter).await,
+        Command::Raw {
+            method,
+            path,
+            query,
+            header,
+            data,
+        } => {
+            let query_pairs = commands::parse_key_value_pairs(query, "--query")?;
+            let header_pairs = commands::parse_header_pairs(header)?;
+            let body = data
+                .as_ref()
+                .map(|d| commands::read_data_arg(d))
+                .transpose()?;
+            let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+            raw::call(
+                &context.client,
+                method.to_method(),
+                path,
+                &query_pairs,
+                &header_pairs,
+                body,
+            )
+            .await
+        }
     }
 }
 
