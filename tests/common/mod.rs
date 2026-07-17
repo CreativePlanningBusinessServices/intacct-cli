@@ -2,9 +2,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use intacct_cli::auth::TokenProvider;
+use intacct_cli::client::IaClient;
 use intacct_cli::error::CliError;
+use wiremock::MockServer;
 
 pub struct StaticToken;
 
@@ -15,4 +18,13 @@ impl TokenProvider for StaticToken {
         Box::pin(async { Ok("TEST_TOKEN".to_string()) })
     }
     fn invalidate(&self) {}
+}
+
+pub fn client_for(server: &MockServer) -> IaClient {
+    IaClient::new(
+        reqwest::Client::new(),
+        server.uri(),
+        Arc::new(StaticToken),
+        None,
+    )
 }
