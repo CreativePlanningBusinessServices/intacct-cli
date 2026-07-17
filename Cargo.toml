@@ -1,0 +1,7 @@
+[package]
+name = "intacct-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Sage Intacct REST API CLI for AI agents"
+
+[dependencies]
