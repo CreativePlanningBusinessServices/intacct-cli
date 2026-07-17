@@ -1,0 +1,2163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>intacct-cli — Implementation Plan (2026-07-17)</title>
+<style>
+  :root { --ink:#1a2233; --muted:#5b6575; --accent:#0a7d4f; --accent-soft:#e6f4ee;
+          --border:#d9dee7; --code-bg:#f4f6f9; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color: var(--ink); line-height: 1.55; max-width: 62rem; margin: 0 auto;
+         padding: 2.5rem 1.5rem 5rem; background: #fff; }
+  h1 { font-size: 1.9rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.35rem; margin-top: 2.5rem; border-bottom: 2px solid var(--accent-soft); padding-bottom: 0.3rem; }
+  h3 { font-size: 1.1rem; margin-top: 2rem; border-bottom: 1px solid var(--border); padding-bottom: 0.25rem; }
+  code, pre { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.86em; }
+  code { background: var(--code-bg); padding: 0.12em 0.35em; border-radius: 4px; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+        padding: 0.9rem 1.1rem; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.93rem; }
+  th, td { border: 1px solid var(--border); padding: 0.45rem 0.65rem; text-align: left; vertical-align: top; }
+  th { background: var(--accent-soft); }
+  blockquote { border-left: 4px solid var(--accent); background: var(--accent-soft);
+               margin: 1rem 0; padding: 0.6rem 1rem; border-radius: 0 8px 8px 0; }
+  ul { padding-left: 1.3rem; }
+  li { margin: 0.25rem 0; }
+  input[type="checkbox"] { margin-right: 0.4rem; }
+  li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.1rem; }
+  .decision-panel { background: var(--accent-soft); border: 1px solid var(--accent);
+                    border-radius: 10px; padding: 1.1rem 1.3rem; margin: 1.6rem 0; }
+  .decision-panel h3 { margin-top: 0; border: none; }
+  .btn { display: inline-block; margin: 0.35rem 0.5rem 0.35rem 0; padding: 0.55rem 1.1rem;
+         border-radius: 8px; text-decoration: none; font-weight: 600; border: 1px solid var(--accent); }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-secondary { background: #fff; color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="decision-panel">
+  <h3>Decision: how should we execute this plan?</h3>
+  <p>19 tasks, each with its own test cycle and commit. Buttons repeat at the bottom.</p>
+  <a class="btn btn-primary" href="http://127.0.0.1:8137/pick?c=subagent&amp;l=Subagent-driven" target="_blank">Subagent-driven (recommended) — fresh subagent per task, review between tasks</a>
+  <a class="btn btn-secondary" href="http://127.0.0.1:8137/pick?c=inline&amp;l=Inline" target="_blank">Inline — execute in this session with checkpoints</a>
+  <a class="btn btn-secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request+changes" target="_blank">I have changes — I'll describe them in chat</a>
+</div>
+<h1>intacct-cli Implementation Plan</h1>
+<blockquote>
+<p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (<code>- [ ]</code>) syntax for tracking.</p>
+</blockquote>
+<p><strong>Goal:</strong> Build <code>intacct-cli</code>, a single-binary Rust CLI for AI agents wrapping the modern Sage Intacct REST API (<code>https://api.intacct.com/ia/api/v1</code>), modeled on <code>netsuite-cli</code>.</p>
+<p><strong>Architecture:</strong> Generic commands over Intacct&#39;s platform endpoints — one <code>object</code> command addresses every object by API path, <code>query</code>/<code>describe</code> wrap the core query/model services, dedicated thin wrappers cover bulk/composite/views/exports/schedules/reports/session-id, and <code>raw</code> is the escape hatch. All logic lives in the library crate; every command handler returns <code>Result&lt;serde_json::Value, CliError&gt;</code>; a single dispatcher owns stdout/stderr and exit codes.</p>
+<p><strong>Tech Stack:</strong> Rust edition 2024, clap 4 (derive), tokio, reqwest (rustls, json, multipart), serde/serde_json, thiserror, keyring 3, directories, toml, rand+sha2+base64 (PKCE), webbrowser, rcgen+rustls+tokio-rustls (loopback HTTPS), rpassword, self_update. Dev: wiremock, tempfile, assert_cmd, predicates.</p>
+<p><strong>Design reference:</strong> the approved spec at <code>docs/superpowers/specs/2026-07-16-intacct-cli-design.html</code>, and the sibling repo <code>~/projects/creativeplanning/netsuite-cli</code> (READ its files when a task says &quot;port&quot;; they are on disk).</p>
+<h2>Global Constraints</h2>
+<ul>
+<li>Repo: <code>/Users/jonlamb/projects/creativeplanning/intacct-cli</code>, branch <code>feature/518814675-intacct-cli</code>. Crate name <code>intacct-cli</code>, lib name <code>intacct_cli</code>, version <code>0.1.0</code>, edition <code>2024</code>.</li>
+<li>stdout carries <strong>exactly one JSON value</strong> per invocation (compact; <code>--pretty</code> indents). Everything else — errors (JSON), prompts, browser URLs, warnings — goes to stderr. The only human-text-on-stdout exceptions: <code>--help</code>/<code>--version</code> (exit 0).</li>
+<li>Exit codes: 0 success · 1 api · 2 usage · 3 auth · 4 network. Error JSON: <code>{&quot;kind&quot;,&quot;message&quot;,...}</code>.</li>
+<li>API base: <code>https://api.intacct.com/ia/api/v1</code>, overridable via env <code>INTACCT_API_BASE</code> (for tests). No per-tenant subdomains.</li>
+<li>Response envelopes: success bodies pass through as-is (<code>ia::result</code>/<code>ia::meta</code>); error bodies map from <code>ia::error</code> (preserve <code>supportId</code>).</li>
+<li>Secrets: OS keyring only (service <code>intacct-cli</code>), never in the TOML config, never CLI flags. Client secret input: env <code>INTACCT_CLI_CLIENT_SECRET</code> or hidden prompt.</li>
+<li>Naming: descriptive names, never single letters. Comments: only for the genuinely non-obvious. Functions ordered top-down (highest-level first).</li>
+<li>Every task ends with <code>cargo fmt</code> clean, <code>cargo clippy --all-targets -- -D warnings</code> clean, <code>cargo test</code> green, then a commit. Commit messages end with <code>Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;</code>.</li>
+<li>clap: <code>color = Never</code>, <code>propagate_version = true</code>, <code>after_help</code> examples on every leaf subcommand, kebab-case flags.</li>
+<li>All integration tests call library functions directly against a <code>wiremock::MockServer</code> (no real network, no real keychain — <code>MemoryStore</code> only).</li>
+</ul>
+<h2>File Map</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Responsibility</th>
+<th>Task</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>Cargo.toml</code></td>
+<td>deps</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>src/main.rs</code></td>
+<td>4-line tokio shim</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>src/lib.rs</code></td>
+<td>module declarations</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>src/error.rs</code></td>
+<td><code>CliError</code>, exit codes, JSON envelope</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>src/output.rs</code></td>
+<td><code>print_json</code> / <code>print_error</code></td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>src/config.rs</code></td>
+<td>TOML config, alias resolution</td>
+<td>2</td>
+</tr>
+<tr>
+<td><code>src/secrets.rs</code></td>
+<td><code>SecretStore</code> trait, keyring + memory stores</td>
+<td>3</td>
+</tr>
+<tr>
+<td><code>src/account.rs</code></td>
+<td>base-URL + username formatting</td>
+<td>4</td>
+</tr>
+<tr>
+<td><code>src/auth/mod.rs</code></td>
+<td><code>TokenProvider</code>, <code>TokenResponse</code></td>
+<td>4</td>
+</tr>
+<tr>
+<td><code>src/auth/client_credentials.rs</code></td>
+<td>client-credentials provider</td>
+<td>5</td>
+</tr>
+<tr>
+<td><code>src/client.rs</code></td>
+<td><code>IaClient</code> retry/error core</td>
+<td>6</td>
+</tr>
+<tr>
+<td><code>tests/common/mod.rs</code></td>
+<td><code>StaticToken</code>, <code>client_for</code></td>
+<td>6</td>
+</tr>
+<tr>
+<td><code>src/context.rs</code></td>
+<td>alias → <code>AccountContext</code></td>
+<td>7</td>
+</tr>
+<tr>
+<td><code>src/cli.rs</code></td>
+<td>clap defs, <code>cli_main</code>, dispatch</td>
+<td>7</td>
+</tr>
+<tr>
+<td><code>src/commands/mod.rs</code></td>
+<td><code>read_data_arg</code> + arg helpers</td>
+<td>7</td>
+</tr>
+<tr>
+<td><code>src/commands/account.rs</code></td>
+<td>account add/list/set-default/remove/test</td>
+<td>7</td>
+</tr>
+<tr>
+<td><code>src/commands/object.rs</code></td>
+<td>generic CRUD</td>
+<td>8</td>
+</tr>
+<tr>
+<td><code>src/commands/query.rs</code></td>
+<td>query service</td>
+<td>9</td>
+</tr>
+<tr>
+<td><code>src/commands/describe.rs</code></td>
+<td>model service + cache</td>
+<td>10</td>
+</tr>
+<tr>
+<td><code>src/commands/raw.rs</code></td>
+<td>escape hatch</td>
+<td>11</td>
+</tr>
+<tr>
+<td><code>src/auth/loopback.rs</code></td>
+<td>loopback HTTPS listener (port)</td>
+<td>12</td>
+</tr>
+<tr>
+<td><code>src/auth/authcode.rs</code></td>
+<td>PKCE login + refresh provider</td>
+<td>12</td>
+</tr>
+<tr>
+<td><code>src/commands/job.rs</code></td>
+<td>bulk service</td>
+<td>13</td>
+</tr>
+<tr>
+<td><code>src/commands/composite.rs</code></td>
+<td>composite + session-id</td>
+<td>14</td>
+</tr>
+<tr>
+<td><code>src/commands/view.rs</code>, <code>src/commands/export.rs</code>, <code>src/commands/report.rs</code></td>
+<td>view/export/report services (schedules &amp; user views turn out to be plain objects — covered by <code>object</code>)</td>
+<td>15</td>
+</tr>
+<tr>
+<td><code>src/commands/config_cmd.rs</code></td>
+<td>config get/set</td>
+<td>16</td>
+</tr>
+<tr>
+<td><code>skills/intacct-cli/SKILL.md</code> + <code>src/commands/skill.rs</code></td>
+<td>agent skill</td>
+<td>17</td>
+</tr>
+<tr>
+<td><code>src/commands/update.rs</code></td>
+<td>self-update</td>
+<td>18</td>
+</tr>
+<tr>
+<td><code>.github/workflows/{ci,release}.yml</code>, <code>tests/live_smoke.rs</code>, <code>README.md</code>, <code>.gitattributes</code></td>
+<td>infra</td>
+<td>19</td>
+</tr>
+</tbody></table>
+<hr>
+<h3>Task 1: Scaffold, error model, output</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>Cargo.toml</code>, <code>src/main.rs</code></li>
+<li>Create: <code>src/lib.rs</code>, <code>src/error.rs</code>, <code>src/output.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li><p>Produces: <code>CliError</code> enum (<code>Api { status: u16, message: String, details: Vec&lt;Value&gt;, support_id: Option&lt;String&gt; }</code>, <code>Usage(String)</code>, <code>Auth(String)</code>, <code>Network(String)</code>) with <code>exit_code() -&gt; u8</code> and <code>to_json() -&gt; Value</code>; <code>output::print_json(&amp;Value, bool)</code>, <code>output::print_error(&amp;CliError)</code>. Every later task consumes these.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 1: Replace <code>Cargo.toml</code></strong></p>
+</li>
+</ul>
+<pre><code class="language-toml">[package]
+name = &quot;intacct-cli&quot;
+version = &quot;0.1.0&quot;
+edition = &quot;2024&quot;
+description = &quot;Sage Intacct REST API CLI for AI agents — multi-account OAuth, objects, query, models&quot;
+
+[dependencies]
+clap = { version = &quot;4.5&quot;, features = [&quot;derive&quot;, &quot;env&quot;] }
+tokio = { version = &quot;1&quot;, features = [&quot;macros&quot;, &quot;rt-multi-thread&quot;, &quot;time&quot;, &quot;net&quot;, &quot;io-util&quot;] }
+reqwest = { version = &quot;0.12&quot;, default-features = false, features = [&quot;json&quot;, &quot;rustls-tls&quot;, &quot;multipart&quot;] }
+serde = { version = &quot;1&quot;, features = [&quot;derive&quot;] }
+serde_json = &quot;1&quot;
+thiserror = &quot;2&quot;
+keyring = { version = &quot;3&quot;, features = [&quot;apple-native&quot;, &quot;windows-native&quot;] }
+directories = &quot;6&quot;
+rand = &quot;0.9&quot;
+sha2 = &quot;0.10&quot;
+base64 = &quot;0.22&quot;
+url = &quot;2&quot;
+toml = &quot;0.8&quot;
+webbrowser = &quot;1&quot;
+rcgen = &quot;0.13&quot;
+rustls = { version = &quot;0.23&quot;, features = [&quot;ring&quot;] }
+tokio-rustls = &quot;0.26&quot;
+self_update = { version = &quot;0.42&quot;, default-features = false, features = [&quot;rustls&quot;, &quot;archive-zip&quot;, &quot;compression-zip-deflate&quot;] }
+rpassword = &quot;7&quot;
+
+[dev-dependencies]
+wiremock = &quot;0.6&quot;
+tempfile = &quot;3&quot;
+assert_cmd = &quot;2&quot;
+predicates = &quot;3&quot;
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Write <code>src/lib.rs</code> and <code>src/main.rs</code></strong></li>
+</ul>
+<p><code>src/lib.rs</code> (modules are added here as later tasks create them; start with what exists):</p>
+<pre><code class="language-rust">pub mod error;
+pub mod output;
+</code></pre>
+<p><code>src/main.rs</code> stays a stub for now (the <code>cli</code> module arrives in Task 7):</p>
+<pre><code class="language-rust">fn main() {
+    // Replaced in Task 7 by: std::process::exit(intacct_cli::cli::cli_main().await)
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Write failing unit tests inside <code>src/error.rs</code></strong></li>
+</ul>
+<p>Create <code>src/error.rs</code> containing ONLY the test module first (types referenced don&#39;t exist yet):</p>
+<pre><code class="language-rust">use serde_json::{Value, json};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_match_error_kinds() {
+        assert_eq!(
+            CliError::Api { status: 400, message: &quot;bad&quot;.into(), details: vec![], support_id: None }.exit_code(),
+            1
+        );
+        assert_eq!(CliError::Usage(&quot;no account&quot;.into()).exit_code(), 2);
+        assert_eq!(CliError::Auth(&quot;expired&quot;.into()).exit_code(), 3);
+        assert_eq!(CliError::Network(&quot;timeout&quot;.into()).exit_code(), 4);
+    }
+
+    #[test]
+    fn api_error_serializes_full_envelope_with_support_id() {
+        let error = CliError::Api {
+            status: 422,
+            message: &quot;operationFailed: Employee Contact info cannot be empty&quot;.into(),
+            details: vec![json!({&quot;code&quot;: &quot;BL01001973&quot;, &quot;message&quot;: &quot;Employee Contact info cannot be empty&quot;})],
+            support_id: Some(&quot;sojLj~X2vg0DE3Vop0PJU6UeQVxQAAAEw&quot;.into()),
+        };
+        assert_eq!(
+            error.to_json(),
+            json!({
+                &quot;kind&quot;: &quot;api&quot;, &quot;status&quot;: 422,
+                &quot;message&quot;: &quot;operationFailed: Employee Contact info cannot be empty&quot;,
+                &quot;details&quot;: [{&quot;code&quot;: &quot;BL01001973&quot;, &quot;message&quot;: &quot;Employee Contact info cannot be empty&quot;}],
+                &quot;supportId&quot;: &quot;sojLj~X2vg0DE3Vop0PJU6UeQVxQAAAEw&quot;,
+            })
+        );
+    }
+
+    #[test]
+    fn api_error_omits_support_id_when_absent() {
+        let error = CliError::Api { status: 404, message: &quot;not found&quot;.into(), details: vec![], support_id: None };
+        assert_eq!(
+            error.to_json(),
+            json!({&quot;kind&quot;: &quot;api&quot;, &quot;status&quot;: 404, &quot;message&quot;: &quot;not found&quot;, &quot;details&quot;: []})
+        );
+    }
+
+    #[test]
+    fn auth_error_serializes_without_status() {
+        assert_eq!(
+            CliError::Auth(&quot;refresh expired&quot;.into()).to_json(),
+            json!({&quot;kind&quot;: &quot;auth&quot;, &quot;message&quot;: &quot;refresh expired&quot;})
+        );
+    }
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 4: Run tests to verify they fail</strong></li>
+</ul>
+<p>Run: <code>cargo test</code>
+Expected: compile error — <code>CliError</code> not found.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 5: Implement <code>CliError</code> above the test module in <code>src/error.rs</code></strong></li>
+</ul>
+<pre><code class="language-rust">#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    #[error(&quot;{message}&quot;)]
+    Api {
+        status: u16,
+        message: String,
+        details: Vec&lt;Value&gt;,
+        support_id: Option&lt;String&gt;,
+    },
+    #[error(&quot;{0}&quot;)]
+    Usage(String),
+    #[error(&quot;{0}&quot;)]
+    Auth(String),
+    #[error(&quot;{0}&quot;)]
+    Network(String),
+}
+
+impl CliError {
+    pub fn exit_code(&amp;self) -&gt; u8 {
+        match self {
+            CliError::Api { .. } =&gt; 1,
+            CliError::Usage(_) =&gt; 2,
+            CliError::Auth(_) =&gt; 3,
+            CliError::Network(_) =&gt; 4,
+        }
+    }
+
+    pub fn to_json(&amp;self) -&gt; Value {
+        match self {
+            CliError::Api { status, message, details, support_id } =&gt; {
+                let mut envelope =
+                    json!({&quot;kind&quot;: &quot;api&quot;, &quot;status&quot;: status, &quot;message&quot;: message, &quot;details&quot;: details});
+                if let Some(id) = support_id {
+                    envelope[&quot;supportId&quot;] = json!(id);
+                }
+                envelope
+            }
+            CliError::Usage(message) =&gt; json!({&quot;kind&quot;: &quot;usage&quot;, &quot;message&quot;: message}),
+            CliError::Auth(message) =&gt; json!({&quot;kind&quot;: &quot;auth&quot;, &quot;message&quot;: message}),
+            CliError::Network(message) =&gt; json!({&quot;kind&quot;: &quot;network&quot;, &quot;message&quot;: message}),
+        }
+    }
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 6: Write <code>src/output.rs</code></strong> (identical to netsuite-cli&#39;s; 17 lines)</li>
+</ul>
+<pre><code class="language-rust">use crate::error::CliError;
+use serde_json::Value;
+
+pub fn print_json(value: &amp;Value, pretty: bool) {
+    if pretty {
+        println!(&quot;{}&quot;, serde_json::to_string_pretty(value).expect(&quot;serializable&quot;));
+    } else {
+        println!(&quot;{}&quot;, serde_json::to_string(value).expect(&quot;serializable&quot;));
+    }
+}
+
+pub fn print_error(error: &amp;CliError) {
+    eprintln!(&quot;{}&quot;, error.to_json());
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 7: Run tests to verify they pass</strong></li>
+</ul>
+<p>Run: <code>cargo test</code>
+Expected: 4 passed.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 8: fmt, clippy, commit</strong></li>
+</ul>
+<p>Run: <code>cargo fmt &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code></p>
+<pre><code class="language-bash">git add -A &amp;&amp; git commit -m &quot;feat: error model and JSON output core
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;&quot;
+</code></pre>
+<hr>
+<h3>Task 2: Config file</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/config.rs</code>; add <code>pub mod config;</code> to <code>src/lib.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>CliError</code>.</li>
+<li>Produces: <code>Config { default_account: Option&lt;String&gt;, accounts: BTreeMap&lt;String, AccountEntry&gt;, cache_ttl_hours: Option&lt;u64&gt; }</code> with <code>load(&amp;Path)</code>, <code>save(&amp;Path)</code>, <code>resolve_alias(flag: Option&lt;&amp;str&gt;, env: Option&lt;&amp;str&gt;) -&gt; Result&lt;String, CliError&gt;</code>; <code>AccountEntry { company_id: String, user_id: Option&lt;String&gt;, entity_id: Option&lt;String&gt;, flow: AuthFlow }</code>; <code>AuthFlow { ClientCredentials, AuthCode }</code> (serde kebab-case: <code>client-credentials</code> / <code>auth-code</code>); <code>default_config_path() -&gt; PathBuf</code>, <code>default_cache_dir() -&gt; PathBuf</code> (ProjectDirs <code>com</code>/<code>CreativePlanning</code>/<code>intacct-cli</code>).</li>
+</ul>
+<p>This is a direct port of <code>~/projects/creativeplanning/netsuite-cli/src/config.rs</code> (149 lines — read it) with these deltas: <code>AccountEntry.account_id: String</code> becomes <code>company_id: String</code> plus new optional fields <code>user_id</code> and <code>entity_id</code> (both <code>#[serde(default, skip_serializing_if = &quot;Option::is_none&quot;)] Option&lt;String&gt;</code>); <code>AuthFlow::M2m</code> becomes <code>AuthFlow::ClientCredentials</code>; the no-account error message becomes <code>&quot;no account selected: pass --account, set INTACCT_ACCOUNT, or run </code>intacct-cli account set-default<code>&quot;</code>; the unknown-alias message references <code>intacct-cli account list</code>; ProjectDirs app name is <code>intacct-cli</code>.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write the failing tests</strong> (inside <code>src/config.rs</code>, port the reference&#39;s three tests adapted to the new fields)</li>
+</ul>
+<pre><code class="language-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -&gt; Config {
+        let mut config = Config::default();
+        config.accounts.insert(
+            &quot;prod&quot;.into(),
+            AccountEntry {
+                company_id: &quot;creativeplanning&quot;.into(),
+                user_id: Some(&quot;svc_api&quot;.into()),
+                entity_id: None,
+                flow: AuthFlow::ClientCredentials,
+            },
+        );
+        config.accounts.insert(
+            &quot;sandbox&quot;.into(),
+            AccountEntry {
+                company_id: &quot;creativeplanning-snd&quot;.into(),
+                user_id: None,
+                entity_id: Some(&quot;CentralUS-35&quot;.into()),
+                flow: AuthFlow::AuthCode,
+            },
+        );
+        config.default_account = Some(&quot;prod&quot;.into());
+        config
+    }
+
+    #[test]
+    fn config_round_trips_through_toml_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(&quot;config.toml&quot;);
+        sample_config().save(&amp;path).unwrap();
+        let loaded = Config::load(&amp;path).unwrap();
+        assert_eq!(loaded.default_account.as_deref(), Some(&quot;prod&quot;));
+        assert_eq!(loaded.accounts[&quot;prod&quot;].user_id.as_deref(), Some(&quot;svc_api&quot;));
+        assert_eq!(loaded.accounts[&quot;sandbox&quot;].entity_id.as_deref(), Some(&quot;CentralUS-35&quot;));
+        assert!(matches!(loaded.accounts[&quot;sandbox&quot;].flow, AuthFlow::AuthCode));
+    }
+
+    #[test]
+    fn missing_config_file_loads_as_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = Config::load(&amp;dir.path().join(&quot;nope.toml&quot;)).unwrap();
+        assert!(loaded.accounts.is_empty());
+    }
+
+    #[test]
+    fn alias_resolution_prefers_flag_then_env_then_default() {
+        let config = sample_config();
+        assert_eq!(config.resolve_alias(Some(&quot;sandbox&quot;), Some(&quot;ignored&quot;)).unwrap(), &quot;sandbox&quot;);
+        assert_eq!(config.resolve_alias(None, Some(&quot;sandbox&quot;)).unwrap(), &quot;sandbox&quot;);
+        assert_eq!(config.resolve_alias(None, None).unwrap(), &quot;prod&quot;);
+        assert!(matches!(config.resolve_alias(Some(&quot;nope&quot;), None), Err(CliError::Usage(_))));
+        assert!(matches!(Config::default().resolve_alias(None, None), Err(CliError::Usage(_))));
+    }
+}
+</code></pre>
+<ul>
+<li><p><input disabled="" type="checkbox"> <strong>Step 2: Run tests to verify they fail</strong> — <code>cargo test config</code> → compile error.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 3: Implement</strong> — port the reference implementation with the deltas listed above. The struct definitions:</p>
+</li>
+</ul>
+<pre><code class="language-rust">use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::CliError;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Config {
+    pub default_account: Option&lt;String&gt;,
+    #[serde(default)]
+    pub accounts: BTreeMap&lt;String, AccountEntry&gt;,
+    #[serde(default)]
+    pub cache_ttl_hours: Option&lt;u64&gt;,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountEntry {
+    pub company_id: String,
+    #[serde(default, skip_serializing_if = &quot;Option::is_none&quot;)]
+    pub user_id: Option&lt;String&gt;,
+    #[serde(default, skip_serializing_if = &quot;Option::is_none&quot;)]
+    pub entity_id: Option&lt;String&gt;,
+    pub flow: AuthFlow,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = &quot;kebab-case&quot;)]
+pub enum AuthFlow {
+    ClientCredentials,
+    AuthCode,
+}
+</code></pre>
+<p><code>load</code>, <code>save</code>, <code>resolve_alias</code>, <code>default_config_path</code>, <code>default_cache_dir</code> are line-for-line ports (same error wrapping into <code>CliError::Usage</code>) with the message/name deltas above.</p>
+<ul>
+<li><p><input disabled="" type="checkbox"> <strong>Step 4: Run tests to verify they pass</strong> — <code>cargo test config</code> → 3 passed.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>git commit -m &quot;feat: TOML config with alias resolution&quot;</code> (+ trailer).</p>
+</li>
+</ul>
+<hr>
+<h3>Task 3: Secret store</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/secrets.rs</code>; add <code>pub mod secrets;</code> to <code>src/lib.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>CliError</code>.</li>
+<li>Produces:</li>
+</ul>
+<pre><code class="language-rust">#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = &quot;kind&quot;, rename_all = &quot;kebab-case&quot;)]
+pub enum AccountSecrets {
+    ClientCredentials { client_id: String, client_secret: String, username: String },
+    AuthCode { client_id: String, client_secret: String, refresh_token: Option&lt;String&gt; },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedToken { pub access_token: String, pub expires_at_epoch: u64 }
+// CachedToken::is_valid_at(&amp;self, now_epoch: u64) -&gt; bool  (60s leeway)
+
+pub trait SecretStore: Send + Sync {
+    fn get(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;AccountSecrets&gt;, CliError&gt;;
+    fn set(&amp;self, alias: &amp;str, secrets: &amp;AccountSecrets) -&gt; Result&lt;(), CliError&gt;;
+    fn delete(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt;;          // sweeps alias + alias#token
+    fn get_token(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;CachedToken&gt;, CliError&gt;;
+    fn set_token(&amp;self, alias: &amp;str, token: &amp;CachedToken) -&gt; Result&lt;(), CliError&gt;;
+    fn delete_token(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt;;
+}
+
+pub struct KeyringStore;               // service name &quot;intacct-cli&quot;
+#[derive(Default)] pub struct MemoryStore { /* Mutex&lt;HashMap&lt;String,String&gt;&gt; */ }
+</code></pre>
+<p>This is a port of <code>~/projects/creativeplanning/netsuite-cli/src/secrets.rs</code> (284 lines — read it) with the TBA trio of trait methods and <code>TbaSecrets</code> <strong>deleted</strong> (Intacct has no SOAP), <code>AccountSecrets</code> variants replaced as above, and <code>KEYRING_SERVICE = &quot;intacct-cli&quot;</code>. Keyring keys: <code>&lt;alias&gt;</code> and <code>&lt;alias&gt;#token</code>; values JSON-serialized; <code>keyring::Error::NoEntry</code> maps to <code>Ok(None)</code>/<code>Ok(())</code>; other keyring errors map to <code>CliError::Auth</code>.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write the failing tests</strong></li>
+</ul>
+<pre><code class="language-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_store_round_trips_secrets_and_tokens() {
+        let store = MemoryStore::default();
+        let secrets = AccountSecrets::ClientCredentials {
+            client_id: &quot;cid.app.sage.com&quot;.into(),
+            client_secret: &quot;shhh&quot;.into(),
+            username: &quot;svc_api@creativeplanning&quot;.into(),
+        };
+        store.set(&quot;prod&quot;, &amp;secrets).unwrap();
+        match store.get(&quot;prod&quot;).unwrap().expect(&quot;stored&quot;) {
+            AccountSecrets::ClientCredentials { username, .. } =&gt; {
+                assert_eq!(username, &quot;svc_api@creativeplanning&quot;)
+            }
+            other =&gt; panic!(&quot;wrong variant: {other:?}&quot;),
+        }
+        assert!(store.get(&quot;absent&quot;).unwrap().is_none());
+
+        let token = CachedToken { access_token: &quot;tok&quot;.into(), expires_at_epoch: 999 };
+        store.set_token(&quot;prod&quot;, &amp;token).unwrap();
+        assert_eq!(store.get_token(&quot;prod&quot;).unwrap().unwrap().access_token, &quot;tok&quot;);
+        store.delete(&quot;prod&quot;).unwrap();
+        assert!(store.get(&quot;prod&quot;).unwrap().is_none());
+        assert!(store.get_token(&quot;prod&quot;).unwrap().is_none());
+    }
+
+    #[test]
+    fn cached_token_expiry_check_uses_leeway() {
+        let now = 1_000_000;
+        let live = CachedToken { access_token: &quot;a&quot;.into(), expires_at_epoch: now + 120 };
+        let stale = CachedToken { access_token: &quot;b&quot;.into(), expires_at_epoch: now + 10 };
+        assert!(live.is_valid_at(now));
+        assert!(!stale.is_valid_at(now));
+    }
+
+    #[test]
+    fn auth_code_secrets_serialize_with_kebab_kind_tag() {
+        let secrets = AccountSecrets::AuthCode {
+            client_id: &quot;cid&quot;.into(),
+            client_secret: &quot;cs&quot;.into(),
+            refresh_token: Some(&quot;rt&quot;.into()),
+        };
+        let raw = serde_json::to_string(&amp;secrets).unwrap();
+        assert!(raw.contains(r#&quot;&quot;kind&quot;:&quot;auth-code&quot;&quot;#), &quot;got: {raw}&quot;);
+    }
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure</strong> — <code>cargo test secrets</code> → compile error.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Implement</strong> per the port instructions above.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 4: Run to verify pass</strong> — <code>cargo test secrets</code> → 3 passed.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: keyring-backed secret store&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 4: URL/username helpers and the TokenProvider trait</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/account.rs</code>, <code>src/auth/mod.rs</code>; add <code>pub mod account;</code> and <code>pub mod auth;</code> to <code>src/lib.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>CliError</code>.</li>
+<li>Produces: <code>account::api_base() -&gt; String</code>, <code>account::token_url() -&gt; String</code>, <code>account::authorize_url() -&gt; String</code>, <code>account::revoke_url() -&gt; String</code>, <code>account::username_for(user_id: &amp;str, company_id: &amp;str, entity_id: Option&lt;&amp;str&gt;) -&gt; String</code>; <code>auth::TokenResponse { access_token: String, expires_in: u64, refresh_token: Option&lt;String&gt; }</code> (Deserialize); <code>auth::TokenProvider</code> trait — object-safe, exactly the reference shape:</li>
+</ul>
+<pre><code class="language-rust">pub trait TokenProvider: Send + Sync {
+    fn access_token&lt;&#39;life&gt;(
+        &amp;&#39;life self,
+    ) -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + &#39;life&gt;&gt;;
+    fn invalidate(&amp;self);
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests in <code>src/account.rs</code></strong></li>
+</ul>
+<pre><code class="language-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn username_formats_tenant_and_optional_entity() {
+        assert_eq!(username_for(&quot;api_user&quot;, &quot;demoCompany&quot;, None), &quot;api_user@demoCompany&quot;);
+        assert_eq!(
+            username_for(&quot;api_user&quot;, &quot;demoCompany&quot;, Some(&quot;Central Region&quot;)),
+            &quot;api_user@demoCompany|Central Region&quot;
+        );
+    }
+
+    #[test]
+    fn api_base_defaults_to_production_host() {
+        // Note: don&#39;t set INTACCT_API_BASE in this test — env is process-global.
+        assert_eq!(default_api_base(), &quot;https://api.intacct.com/ia/api/v1&quot;);
+    }
+
+    #[test]
+    fn oauth_urls_hang_off_the_base() {
+        assert!(token_url().ends_with(&quot;/oauth2/token&quot;));
+        assert!(authorize_url().ends_with(&quot;/oauth2/authorize&quot;));
+        assert!(revoke_url().ends_with(&quot;/oauth2/revoke&quot;));
+    }
+}
+</code></pre>
+<ul>
+<li><p><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure</strong> — <code>cargo test account</code> → compile error.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 3: Implement <code>src/account.rs</code></strong></p>
+</li>
+</ul>
+<pre><code class="language-rust">pub const DEFAULT_API_BASE: &amp;str = &quot;https://api.intacct.com/ia/api/v1&quot;;
+
+/// Single global host — tenant selection travels in the OAuth username, not the URL.
+/// INTACCT_API_BASE exists so live-smoke tests and local mocks can redirect the whole CLI.
+pub fn api_base() -&gt; String {
+    std::env::var(&quot;INTACCT_API_BASE&quot;)
+        .map(|base| base.trim_end_matches(&#39;/&#39;).to_string())
+        .unwrap_or_else(|_| default_api_base())
+}
+
+pub fn default_api_base() -&gt; String {
+    DEFAULT_API_BASE.to_string()
+}
+
+pub fn token_url() -&gt; String {
+    format!(&quot;{}/oauth2/token&quot;, api_base())
+}
+
+pub fn authorize_url() -&gt; String {
+    format!(&quot;{}/oauth2/authorize&quot;, api_base())
+}
+
+pub fn revoke_url() -&gt; String {
+    format!(&quot;{}/oauth2/revoke&quot;, api_base())
+}
+
+/// Intacct embeds the tenant in the client-credentials username:
+/// `userId@companyId` at top level, `userId@companyId|entityId` entity-scoped.
+pub fn username_for(user_id: &amp;str, company_id: &amp;str, entity_id: Option&lt;&amp;str&gt;) -&gt; String {
+    match entity_id {
+        Some(entity) =&gt; format!(&quot;{user_id}@{company_id}|{entity}&quot;),
+        None =&gt; format!(&quot;{user_id}@{company_id}&quot;),
+    }
+}
+</code></pre>
+<ul>
+<li><p><input disabled="" type="checkbox"> <strong>Step 4: Write <code>src/auth/mod.rs</code></strong> — port <code>~/projects/creativeplanning/netsuite-cli/src/auth/mod.rs</code> (29 lines) dropping the <code>m2m</code>/<code>tba</code> module declarations; declare nothing yet (submodules arrive in Tasks 5 and 12): keep only <code>TokenResponse</code> and <code>TokenProvider</code> for now.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 5: Run to verify pass</strong> — <code>cargo test</code> → all green.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 6: fmt, clippy, commit</strong> — <code>&quot;feat: base-URL/username helpers and TokenProvider trait&quot;</code>.</p>
+</li>
+</ul>
+<hr>
+<h3>Task 5: Client-credentials token provider</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/auth/client_credentials.rs</code>; add <code>pub mod client_credentials;</code> to <code>src/auth/mod.rs</code></li>
+<li>Test: <code>tests/client_credentials_auth.rs</code> + <code>tests/common/mod.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>TokenProvider</code>, <code>TokenResponse</code>, <code>SecretStore</code>, <code>CachedToken</code>, <code>CliError</code>.</li>
+<li>Produces:</li>
+</ul>
+<pre><code class="language-rust">pub struct ClientCredentialsConfig {
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub username: String,
+}
+pub struct ClientCredentialsProvider { /* http, alias, config, store */ }
+impl ClientCredentialsProvider {
+    pub fn new(http: reqwest::Client, alias: String, config: ClientCredentialsConfig,
+               store: Arc&lt;dyn SecretStore&gt;) -&gt; Self;
+}
+impl TokenProvider for ClientCredentialsProvider { /* cache-aware */ }
+</code></pre>
+<p>Behavior (mirror <code>M2mProvider</code> in <code>~/projects/creativeplanning/netsuite-cli/src/auth/m2m.rs</code>, minus all JWT machinery): <code>access_token()</code> returns the keyring-cached token when <code>is_valid_at(now)</code>, else POSTs the token endpoint with <strong>JSON body</strong> (Intacct documents JSON for client credentials) <code>{&quot;grant_type&quot;:&quot;client_credentials&quot;,&quot;client_id&quot;:...,&quot;client_secret&quot;:...,&quot;username&quot;:...}</code>, parses <code>TokenResponse</code>, persists <code>CachedToken { access_token, expires_at_epoch: now + expires_in }</code>, returns the token. Non-2xx → <code>CliError::Auth(&quot;token endpoint returned {status}: {body}&quot;)</code>. Transport failure → <code>CliError::Network</code>. <code>invalidate()</code> deletes the cached token, ignoring errors.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Create <code>tests/common/mod.rs</code></strong> (shared by all later integration tests). <code>IaClient</code> doesn&#39;t exist until Task 6, so THIS task creates only <code>StaticToken</code>; Task 6 adds <code>client_for</code>. Full file as of this task:</li>
+</ul>
+<pre><code class="language-rust">#![allow(dead_code)] // helpers are shared across test binaries; not every binary uses every helper
+
+use std::future::Future;
+use std::pin::Pin;
+
+use intacct_cli::auth::TokenProvider;
+use intacct_cli::error::CliError;
+
+pub struct StaticToken;
+
+impl TokenProvider for StaticToken {
+    fn access_token&lt;&#39;life&gt;(
+        &amp;&#39;life self,
+    ) -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + &#39;life&gt;&gt; {
+        Box::pin(async { Ok(&quot;TEST_TOKEN&quot;.to_string()) })
+    }
+    fn invalidate(&amp;self) {}
+}
+</code></pre>
+<p>And the addition Task 6 makes (shown here so both tasks agree on the signature):</p>
+<pre><code class="language-rust">use std::sync::Arc;
+use intacct_cli::client::IaClient;
+
+pub fn client_for(server: &amp;wiremock::MockServer) -&gt; IaClient {
+    IaClient::new(reqwest::Client::new(), server.uri(), Arc::new(StaticToken), None)
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Write failing test <code>tests/client_credentials_auth.rs</code></strong></li>
+</ul>
+<pre><code class="language-rust">mod common;
+
+use std::sync::Arc;
+
+use intacct_cli::auth::TokenProvider;
+use intacct_cli::auth::client_credentials::{ClientCredentialsConfig, ClientCredentialsProvider};
+use intacct_cli::secrets::{CachedToken, MemoryStore, SecretStore};
+use serde_json::json;
+use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn provider_for(server: &amp;MockServer, store: Arc&lt;MemoryStore&gt;) -&gt; ClientCredentialsProvider {
+    ClientCredentialsProvider::new(
+        reqwest::Client::new(),
+        &quot;prod&quot;.into(),
+        ClientCredentialsConfig {
+            token_url: format!(&quot;{}/oauth2/token&quot;, server.uri()),
+            client_id: &quot;cid.app.sage.com&quot;.into(),
+            client_secret: &quot;shhh&quot;.into(),
+            username: &quot;svc_api@creativeplanning&quot;.into(),
+        },
+        store,
+    )
+}
+
+#[tokio::test]
+async fn fetches_and_caches_a_fresh_token() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;POST&quot;))
+        .and(path(&quot;/oauth2/token&quot;))
+        .and(body_partial_json(json!({
+            &quot;grant_type&quot;: &quot;client_credentials&quot;,
+            &quot;client_id&quot;: &quot;cid.app.sage.com&quot;,
+            &quot;client_secret&quot;: &quot;shhh&quot;,
+            &quot;username&quot;: &quot;svc_api@creativeplanning&quot;,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            &quot;token_type&quot;: &quot;Bearer&quot;, &quot;access_token&quot;: &quot;FRESH&quot;, &quot;refresh_token&quot;: &quot;rt&quot;, &quot;expires_in&quot;: 43200
+        })))
+        .expect(1)
+        .mount(&amp;server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let provider = provider_for(&amp;server, store.clone());
+    assert_eq!(provider.access_token().await.unwrap(), &quot;FRESH&quot;);
+    let cached = store.get_token(&quot;prod&quot;).unwrap().expect(&quot;token cached&quot;);
+    assert_eq!(cached.access_token, &quot;FRESH&quot;);
+}
+
+#[tokio::test]
+async fn returns_cached_token_without_hitting_the_network() {
+    let server = MockServer::start().await; // no mocks mounted: any request would 404
+    let store = Arc::new(MemoryStore::default());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    store.set_token(&quot;prod&quot;, &amp;CachedToken { access_token: &quot;CACHED&quot;.into(), expires_at_epoch: now + 3600 }).unwrap();
+
+    let provider = provider_for(&amp;server, store);
+    assert_eq!(provider.access_token().await.unwrap(), &quot;CACHED&quot;);
+}
+
+#[tokio::test]
+async fn token_endpoint_failure_is_an_auth_error() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;POST&quot;)).and(path(&quot;/oauth2/token&quot;))
+        .respond_with(ResponseTemplate::new(401).set_body_string(&quot;bad client&quot;))
+        .mount(&amp;server)
+        .await;
+    let provider = provider_for(&amp;server, Arc::new(MemoryStore::default()));
+    assert!(matches!(
+        provider.access_token().await,
+        Err(intacct_cli::error::CliError::Auth(_))
+    ));
+}
+</code></pre>
+<ul>
+<li><p><input disabled="" type="checkbox"> <strong>Step 3: Run to verify failure</strong> — <code>cargo test --test client_credentials_auth</code> → compile error.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 4: Implement <code>src/auth/client_credentials.rs</code></strong></p>
+</li>
+</ul>
+<pre><code class="language-rust">use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
+
+use crate::auth::{TokenProvider, TokenResponse};
+use crate::error::CliError;
+use crate::secrets::{CachedToken, SecretStore};
+
+pub struct ClientCredentialsConfig {
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub username: String,
+}
+
+pub struct ClientCredentialsProvider {
+    http: reqwest::Client,
+    alias: String,
+    config: ClientCredentialsConfig,
+    store: Arc&lt;dyn SecretStore&gt;,
+}
+
+impl ClientCredentialsProvider {
+    pub fn new(
+        http: reqwest::Client,
+        alias: String,
+        config: ClientCredentialsConfig,
+        store: Arc&lt;dyn SecretStore&gt;,
+    ) -&gt; Self {
+        ClientCredentialsProvider { http, alias, config, store }
+    }
+
+    async fn fetch_fresh_token(&amp;self) -&gt; Result&lt;String, CliError&gt; {
+        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let response = self
+            .http
+            .post(&amp;self.config.token_url)
+            .json(&amp;json!({
+                &quot;grant_type&quot;: &quot;client_credentials&quot;,
+                &quot;client_id&quot;: self.config.client_id,
+                &quot;client_secret&quot;: self.config.client_secret,
+                &quot;username&quot;: self.config.username,
+            }))
+            .send()
+            .await
+            .map_err(|send_error| CliError::Network(format!(&quot;token request failed: {send_error}&quot;)))?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|read_error| {
+            CliError::Network(format!(&quot;reading token response failed: {read_error}&quot;))
+        })?;
+        if !status.is_success() {
+            return Err(CliError::Auth(format!(&quot;token endpoint returned {status}: {body}&quot;)));
+        }
+        let token: TokenResponse = serde_json::from_str(&amp;body)
+            .map_err(|parse_error| CliError::Auth(format!(&quot;bad token response: {parse_error}&quot;)))?;
+        self.store.set_token(
+            &amp;self.alias,
+            &amp;CachedToken {
+                access_token: token.access_token.clone(),
+                expires_at_epoch: now_epoch + token.expires_in,
+            },
+        )?;
+        Ok(token.access_token)
+    }
+}
+
+impl TokenProvider for ClientCredentialsProvider {
+    fn access_token&lt;&#39;life&gt;(
+        &amp;&#39;life self,
+    ) -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + &#39;life&gt;&gt; {
+        Box::pin(async move {
+            let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            if let Some(cached) = self.store.get_token(&amp;self.alias)?
+                &amp;&amp; cached.is_valid_at(now_epoch)
+            {
+                return Ok(cached.access_token);
+            }
+            self.fetch_fresh_token().await
+        })
+    }
+
+    fn invalidate(&amp;self) {
+        let _ = self.store.delete_token(&amp;self.alias);
+    }
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 5: Run to verify pass</strong> — <code>cargo test --test client_credentials_auth</code> → 3 passed.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 6: fmt, clippy, commit</strong> — <code>&quot;feat: client-credentials token provider&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 6: HTTP client core (<code>IaClient</code>)</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/client.rs</code>; add <code>pub mod client;</code> to <code>src/lib.rs</code></li>
+<li>Modify: <code>tests/common/mod.rs</code> (add <code>client_for</code>)</li>
+<li>Test: <code>tests/client.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>TokenProvider</code>, <code>CliError</code>.</li>
+<li>Produces:</li>
+</ul>
+<pre><code class="language-rust">pub struct IaClient { /* http, base, tokens, entity */ }
+pub struct IaResponse { pub status: u16, pub body: Option&lt;Value&gt;, pub location: Option&lt;String&gt; }
+impl IaClient {
+    pub fn new(http: reqwest::Client, base: String, tokens: Arc&lt;dyn TokenProvider&gt;,
+               entity: Option&lt;String&gt;) -&gt; IaClient;
+    pub fn base(&amp;self) -&gt; &amp;str;
+    pub async fn request(&amp;self, method: reqwest::Method, path: &amp;str,
+                         query: &amp;[(&amp;str, String)], headers: &amp;[(&amp;str, &amp;str)],
+                         body: Option&lt;&amp;Value&gt;) -&gt; Result&lt;IaResponse, CliError&gt;;
+    pub async fn request_multipart(&amp;self, path: &amp;str,
+                                   build_form: &amp;(dyn Fn() -&gt; reqwest::multipart::Form + Send + Sync))
+                                   -&gt; Result&lt;IaResponse, CliError&gt;;
+}
+</code></pre>
+<p>Port of <code>~/projects/creativeplanning/netsuite-cli/src/client.rs</code> (154 lines — read it). Identical retry semantics: <code>MAX_ATTEMPTS = 4</code>, base backoff 500ms exponential; 401 → <code>tokens.invalidate()</code> + one retry; 429/5xx → <code>Retry-After</code> header else backoff; absolute <code>http(s)://</code> paths pass through (needed for following <code>ia::meta.next</code> URLs); <code>Location</code> header captured. Deltas:</p>
+<ol>
+<li>Rename <code>NsClient</code>/<code>NsResponse</code> → <code>IaClient</code>/<code>IaResponse</code>; constructor takes <code>entity: Option&lt;String&gt;</code> and, when <code>Some</code>, every request gets header <code>X-IA-API-Param-Entity: &lt;entity&gt;</code>.</li>
+<li><code>api_error</code> maps Intacct&#39;s <code>ia::error</code> envelope instead of NetSuite&#39;s <code>o:errorDetails</code>:</li>
+</ol>
+<pre><code class="language-rust">fn api_error(status: u16, parsed: Option&lt;Value&gt;, raw: String) -&gt; CliError {
+    let Some(body) = parsed else {
+        return CliError::Api { status, message: raw, details: vec![], support_id: None };
+    };
+    let error = &amp;body[&quot;ia::error&quot;];
+    if error.is_null() {
+        return CliError::Api { status, message: raw, details: vec![], support_id: None };
+    }
+    let code = error[&quot;code&quot;].as_str().unwrap_or(&quot;&quot;);
+    let text = error[&quot;message&quot;].as_str().unwrap_or(&quot;request failed&quot;);
+    let message = if code.is_empty() { text.to_string() } else { format!(&quot;{code}: {text}&quot;) };
+    let details = error[&quot;details&quot;].as_array().cloned().unwrap_or_default();
+    let support_id = error[&quot;supportId&quot;].as_str().map(str::to_string);
+    CliError::Api { status, message, details, support_id }
+}
+</code></pre>
+<ol start="3">
+<li>New <code>request_multipart</code> (for the Task-13 bulk service): same retry loop shape, but the body is rebuilt via <code>build_form()</code> on every attempt (a <code>multipart::Form</code> is consumed by send). No JSON body, no query params; bearer + entity header identical.</li>
+</ol>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests <code>tests/client.rs</code></strong> — port the reference <code>tests/client.rs</code> patterns; the essential four:</li>
+</ul>
+<pre><code class="language-rust">mod common;
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use intacct_cli::auth::TokenProvider;
+use intacct_cli::client::IaClient;
+use intacct_cli::error::CliError;
+use serde_json::json;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn success_passes_body_through_and_sends_bearer() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/accounts-payable/vendor/42&quot;))
+        .and(header(&quot;authorization&quot;, &quot;Bearer TEST_TOKEN&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({&quot;ia::result&quot;: {&quot;key&quot;: &quot;42&quot;}})))
+        .mount(&amp;server).await;
+    let client = common::client_for(&amp;server);
+    let response = client.request(reqwest::Method::GET, &quot;/objects/accounts-payable/vendor/42&quot;, &amp;[], &amp;[], None).await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body.unwrap()[&quot;ia::result&quot;][&quot;key&quot;], &quot;42&quot;);
+}
+
+#[tokio::test]
+async fn entity_header_is_sent_when_configured() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/accounts-payable/vendor&quot;))
+        .and(header(&quot;X-IA-API-Param-Entity&quot;, &quot;CentralUS-35&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({&quot;ia::result&quot;: []})))
+        .expect(1)
+        .mount(&amp;server).await;
+    let client = IaClient::new(reqwest::Client::new(), server.uri(),
+        Arc::new(common::StaticToken), Some(&quot;CentralUS-35&quot;.into()));
+    client.request(reqwest::Method::GET, &quot;/objects/accounts-payable/vendor&quot;, &amp;[], &amp;[], None).await.unwrap();
+}
+
+#[tokio::test]
+async fn intacct_error_body_maps_to_api_error_with_support_id() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/x/y/1&quot;))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            &quot;ia::error&quot;: {
+                &quot;code&quot;: &quot;operationFailed&quot;,
+                &quot;message&quot;: &quot;Operation create object HQemployee failed&quot;,
+                &quot;supportId&quot;: &quot;sojLj~X2&quot;,
+                &quot;details&quot;: [{&quot;code&quot;: &quot;BL01001973&quot;, &quot;message&quot;: &quot;Employee Contact info cannot be empty&quot;}]
+            }
+        })))
+        .mount(&amp;server).await;
+    let client = common::client_for(&amp;server);
+    let error = client.request(reqwest::Method::GET, &quot;/objects/x/y/1&quot;, &amp;[], &amp;[], None).await.unwrap_err();
+    match error {
+        CliError::Api { status, message, details, support_id } =&gt; {
+            assert_eq!(status, 422);
+            assert_eq!(message, &quot;operationFailed: Operation create object HQemployee failed&quot;);
+            assert_eq!(details.len(), 1);
+            assert_eq!(support_id.as_deref(), Some(&quot;sojLj~X2&quot;));
+        }
+        other =&gt; panic!(&quot;wrong error: {other:?}&quot;),
+    }
+}
+
+struct CountingTokens(AtomicU32);
+impl TokenProvider for CountingTokens {
+    fn access_token&lt;&#39;life&gt;(&amp;&#39;life self)
+        -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + &#39;life&gt;&gt; {
+        let calls = self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(if calls == 0 { &quot;STALE&quot;.into() } else { &quot;FRESH&quot;.into() }) })
+    }
+    fn invalidate(&amp;self) {}
+}
+
+#[tokio::test]
+async fn unauthorized_response_invalidates_and_retries_once() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/a/b&quot;))
+        .and(header(&quot;authorization&quot;, &quot;Bearer STALE&quot;))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({&quot;ia::error&quot;: {&quot;code&quot;: &quot;GW-0031&quot;, &quot;message&quot;: &quot;invalid token&quot;}})))
+        .mount(&amp;server).await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/a/b&quot;))
+        .and(header(&quot;authorization&quot;, &quot;Bearer FRESH&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({&quot;ia::result&quot;: []})))
+        .mount(&amp;server).await;
+    let client = IaClient::new(reqwest::Client::new(), server.uri(),
+        Arc::new(CountingTokens(AtomicU32::new(0))), None);
+    let response = client.request(reqwest::Method::GET, &quot;/objects/a/b&quot;, &amp;[], &amp;[], None).await.unwrap();
+    assert_eq!(response.status, 200);
+}
+</code></pre>
+<p>Also add a 429-with-Retry-After test (respond once with <code>ResponseTemplate::new(429).insert_header(&quot;retry-after&quot;, &quot;0&quot;)</code> then 200 — use <code>.up_to_n_times(1)</code> on the 429 mock) and a multipart test in Task 13.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Add <code>client_for</code> to <code>tests/common/mod.rs</code></strong> (shown in Task 5 Step 1).</li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Run to verify failure</strong> — <code>cargo test --test client</code> → compile error.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 4: Implement <code>src/client.rs</code></strong> per the port + deltas above.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: Run to verify pass</strong> — <code>cargo test --test client</code> → all passed.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 6: fmt, clippy, commit</strong> — <code>&quot;feat: retrying Intacct HTTP client with ia::error mapping&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 7: Context, CLI skeleton, account commands</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/context.rs</code>, <code>src/cli.rs</code>, <code>src/commands/mod.rs</code>, <code>src/commands/account.rs</code>; add <code>pub mod cli; pub mod commands; pub mod context;</code> to <code>src/lib.rs</code></li>
+<li>Modify: <code>src/main.rs</code></li>
+<li>Test: <code>tests/account_commands.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: everything from Tasks 1–6.</li>
+<li>Produces:<ul>
+<li><code>context::AccountContext { alias: String, company_id: String, client: IaClient }</code> and <code>context::context_for(alias_flag: Option&lt;&amp;str&gt;, entity_flag: Option&lt;&amp;str&gt;) -&gt; Result&lt;AccountContext, CliError&gt;</code> — loads config from <code>default_config_path()</code>, resolves alias (env <code>INTACCT_ACCOUNT</code>), reads <code>KeyringStore</code> secrets, builds the matching provider (<code>ClientCredentials</code> now; <code>AuthCode</code> arm added in Task 12 — until then that arm returns <code>CliError::Auth(&quot;auth-code accounts arrive in a later task&quot;)</code>), constructs <code>IaClient</code> with <code>account::api_base()</code> and <code>entity_flag</code>.</li>
+<li><code>cli::cli_main() -&gt; i32</code> and <code>handle_clap_error</code> — port lines 520–555 of <code>~/projects/creativeplanning/netsuite-cli/src/cli.rs</code> verbatim (they are shown in that file; the doc comment explaining the help/version exception comes along).</li>
+<li><code>Cli</code> struct: global <code>--account</code>, global <code>--entity</code>, global <code>--pretty</code>; <code>#[command(name = &quot;intacct-cli&quot;, version, about = &quot;Sage Intacct REST API CLI for AI agents&quot;, propagate_version = true, color = clap::ColorChoice::Never)]</code>.</li>
+<li><code>commands::read_data_arg</code>, <code>commands::parse_key_value_pairs</code>, <code>commands::parse_header_pairs</code> — port <code>~/projects/creativeplanning/netsuite-cli/src/commands/mod.rs</code> (103 lines) verbatim including its four tests.</li>
+<li>Account command functions in <code>src/commands/account.rs</code>, all taking <code>store: &amp;dyn SecretStore</code> and a <code>config_path: &amp;Path</code> so tests inject <code>MemoryStore</code> + tempdir:</li>
+</ul>
+</li>
+</ul>
+<pre><code class="language-rust">pub struct AddArgs {
+    pub alias: String,
+    pub company_id: String,
+    pub flow: AuthFlow,
+    pub client_id: String,
+    pub client_secret: String,        // resolved by cli.rs: env INTACCT_CLI_CLIENT_SECRET or rpassword prompt
+    pub user_id: Option&lt;String&gt;,      // required for client-credentials
+    pub entity_id: Option&lt;String&gt;,
+}
+pub fn add(config_path: &amp;Path, store: &amp;dyn SecretStore, args: AddArgs) -&gt; Result&lt;Value, CliError&gt;;
+pub fn list(config_path: &amp;Path) -&gt; Result&lt;Value, CliError&gt;;
+pub fn set_default(config_path: &amp;Path, alias: &amp;str) -&gt; Result&lt;Value, CliError&gt;;
+pub fn remove(config_path: &amp;Path, store: &amp;dyn SecretStore, alias: &amp;str) -&gt; Result&lt;Value, CliError&gt;;
+pub async fn test(context: &amp;AccountContext) -&gt; Result&lt;Value, CliError&gt;;
+</code></pre>
+<p>Behaviors:</p>
+<ul>
+<li><code>add</code> (client-credentials path in this task; auth-code arm errors until Task 12): validates <code>user_id</code> present for client-credentials (<code>CliError::Usage(&quot;--user-id is required for the client-credentials flow&quot;)</code>); builds <code>username = account::username_for(user_id, company_id, entity_id)</code>; <strong>writes config first</strong> (<code>AccountEntry</code>, first account becomes <code>default_account</code>), <strong>then</strong> stores <code>AccountSecrets::ClientCredentials { client_id, client_secret, username }</code> — so a keychain failure leaves a re-runnable state. Returns <code>{&quot;alias&quot;,&quot;companyId&quot;,&quot;flow&quot;:&quot;client-credentials&quot;,&quot;default&quot;:bool}</code>.</li>
+<li><code>list</code>: <code>{&quot;accounts&quot;:[{&quot;alias&quot;,&quot;companyId&quot;,&quot;userId&quot;?,&quot;entityId&quot;?,&quot;flow&quot;,&quot;default&quot;:bool}], &quot;count&quot;:n}</code> — no secrets, ever.</li>
+<li><code>set_default</code>: validates alias exists, saves, returns <code>{&quot;defaultAccount&quot;: alias}</code>.</li>
+<li><code>remove</code>: drops the config entry (clearing <code>default_account</code> if it pointed there), <code>store.delete(alias)</code>, returns <code>{&quot;removed&quot;: alias}</code>.</li>
+<li><code>test</code>: <code>GET /services/core/model?name=company-config/user&amp;schema=false</code> via <code>context.client</code>; success → <code>{&quot;ok&quot;: true, &quot;alias&quot;, &quot;companyId&quot;}</code>.</li>
+</ul>
+<p>CLI wiring in <code>dispatch</code> (port the shape of the reference <code>dispatch</code>/<code>dispatch_account</code>): <code>AccountAction::{Add, List, SetDefault, Remove, Test}</code>. Secret resolution for <code>add</code> lives in cli.rs: try <code>std::env::var(&quot;INTACCT_CLI_CLIENT_SECRET&quot;)</code>; else if stdin is a terminal (<code>std::io::stdin().is_terminal()</code>), <code>rpassword::prompt_password(&quot;Client secret: &quot;)</code> (to stderr); else <code>CliError::Usage(&quot;set INTACCT_CLI_CLIENT_SECRET or run interactively to be prompted&quot;)</code>.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests <code>tests/account_commands.rs</code></strong></li>
+</ul>
+<pre><code class="language-rust">mod common;
+
+use intacct_cli::commands::account::{self, AddArgs};
+use intacct_cli::config::AuthFlow;
+use intacct_cli::secrets::{AccountSecrets, MemoryStore, SecretStore};
+use serde_json::json;
+
+fn add_args(alias: &amp;str) -&gt; AddArgs {
+    AddArgs {
+        alias: alias.into(),
+        company_id: &quot;creativeplanning&quot;.into(),
+        flow: AuthFlow::ClientCredentials,
+        client_id: &quot;cid.app.sage.com&quot;.into(),
+        client_secret: &quot;shhh&quot;.into(),
+        user_id: Some(&quot;svc_api&quot;.into()),
+        entity_id: None,
+    }
+}
+
+#[test]
+fn add_stores_config_and_secrets_and_first_account_becomes_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(&quot;config.toml&quot;);
+    let store = MemoryStore::default();
+
+    let result = account::add(&amp;config_path, &amp;store, add_args(&quot;prod&quot;)).unwrap();
+    assert_eq!(result, json!({&quot;alias&quot;: &quot;prod&quot;, &quot;companyId&quot;: &quot;creativeplanning&quot;,
+                              &quot;flow&quot;: &quot;client-credentials&quot;, &quot;default&quot;: true}));
+
+    match store.get(&quot;prod&quot;).unwrap().expect(&quot;secrets stored&quot;) {
+        AccountSecrets::ClientCredentials { username, .. } =&gt; {
+            assert_eq!(username, &quot;svc_api@creativeplanning&quot;)
+        }
+        other =&gt; panic!(&quot;wrong variant: {other:?}&quot;),
+    }
+    let listed = account::list(&amp;config_path).unwrap();
+    assert_eq!(listed[&quot;count&quot;], 1);
+    assert_eq!(listed[&quot;accounts&quot;][0][&quot;default&quot;], true);
+    // list output must never contain secret material
+    assert!(!listed.to_string().contains(&quot;shhh&quot;));
+}
+
+#[test]
+fn add_requires_user_id_for_client_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = MemoryStore::default();
+    let mut args = add_args(&quot;prod&quot;);
+    args.user_id = None;
+    assert!(matches!(
+        account::add(&amp;dir.path().join(&quot;config.toml&quot;), &amp;store, args),
+        Err(intacct_cli::error::CliError::Usage(_))
+    ));
+}
+
+#[test]
+fn remove_sweeps_config_default_and_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(&quot;config.toml&quot;);
+    let store = MemoryStore::default();
+    account::add(&amp;config_path, &amp;store, add_args(&quot;prod&quot;)).unwrap();
+
+    account::remove(&amp;config_path, &amp;store, &quot;prod&quot;).unwrap();
+    assert!(store.get(&quot;prod&quot;).unwrap().is_none());
+    let listed = account::list(&amp;config_path).unwrap();
+    assert_eq!(listed[&quot;count&quot;], 0);
+}
+
+#[tokio::test]
+async fn test_command_hits_the_model_service() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/services/core/model&quot;))
+        .and(query_param(&quot;name&quot;, &quot;company-config/user&quot;))
+        .and(query_param(&quot;schema&quot;, &quot;false&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({&quot;ia::result&quot;: {&quot;name&quot;: &quot;user&quot;}})))
+        .expect(1)
+        .mount(&amp;server).await;
+
+    let context = intacct_cli::context::AccountContext {
+        alias: &quot;prod&quot;.into(),
+        company_id: &quot;creativeplanning&quot;.into(),
+        client: common::client_for(&amp;server),
+    };
+    let result = account::test(&amp;context).await.unwrap();
+    assert_eq!(result[&quot;ok&quot;], true);
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure</strong> — <code>cargo test --test account_commands</code> → compile error.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Implement</strong> <code>src/commands/mod.rs</code> (verbatim port), <code>src/commands/account.rs</code>, <code>src/context.rs</code>, <code>src/cli.rs</code> (Cli struct + <code>Command::Account</code> only for now + <code>cli_main</code> + <code>handle_clap_error</code> + <code>dispatch</code>), and point <code>src/main.rs</code> at it:</li>
+</ul>
+<pre><code class="language-rust">#[tokio::main]
+async fn main() {
+    std::process::exit(intacct_cli::cli::cli_main().await);
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 4: Run to verify pass</strong> — <code>cargo test</code> → all green. Also sanity-check the binary: <code>cargo run -- account list</code> prints <code>{&quot;accounts&quot;:[],&quot;count&quot;:0}</code> and <code>cargo run -- --help</code> prints human help, exit 0.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: account management commands and CLI entrypoint&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 8: Generic object CRUD</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/object.rs</code>; add <code>pub mod object;</code> to <code>src/commands/mod.rs</code></li>
+<li>Modify: <code>src/cli.rs</code> (add <code>Command::Object { action: ObjectAction }</code> + dispatch arms)</li>
+<li>Test: <code>tests/object_commands.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>IaClient</code>, <code>read_data_arg</code>, <code>CliError</code>.</li>
+<li>Produces (all <code>pub async</code>, all returning <code>Result&lt;Value, CliError&gt;</code>):</li>
+</ul>
+<pre><code class="language-rust">pub async fn get(client: &amp;IaClient, object_path: &amp;str, keys: &amp;str) -&gt; ...;
+pub async fn list(client: &amp;IaClient, object_path: &amp;str,
+                  start: Option&lt;u64&gt;, size: Option&lt;u64&gt;, fetch_all: bool) -&gt; ...;
+pub async fn create(client: &amp;IaClient, object_path: &amp;str, data: Value,
+                    atomic: bool, idempotency_key: Option&lt;String&gt;) -&gt; ...;
+pub async fn update(client: &amp;IaClient, object_path: &amp;str, key: Option&lt;&amp;str&gt;, data: Value,
+                    atomic: bool, idempotency_key: Option&lt;String&gt;) -&gt; ...;
+pub async fn delete(client: &amp;IaClient, object_path: &amp;str, keys: &amp;str) -&gt; ...;
+</code></pre>
+<p>Semantics (paths are <code>application/object</code> or <code>application/document::Type</code> or <code>platform-apps/nsp::name</code> — the CLI never validates them, the API does):</p>
+<ul>
+<li><code>get</code>: <code>GET /objects/{object_path}/{keys}</code> (keys may be a comma list, passed through). Body passes through.</li>
+<li><code>list</code>: <code>GET /objects/{object_path}</code>; <code>start</code>/<code>size</code> forwarded as query params when given (the query service documents these names; the GET list endpoint accepts them — verified against live API during smoke testing, harmless if ignored). Without <code>--all</code>: pass the page through. With <code>--all</code>: merge pages by following <code>ia::meta.next</code>. On each page: items come from <code>ia::result</code> (array), <code>next</code> from <code>ia::meta.next</code>. <code>next</code> may be an absolute or server-relative URL — pass it back into <code>client.request</code> as the path (the client already handles absolute URLs; if it is a bare number, treat it as the <code>start</code> query param for the next request — handle both, decided at runtime by whether it parses as <code>u64</code>). Merged envelope: <code>{&quot;items&quot;: [...], &quot;count&quot;: n, &quot;totalCount&quot;: &lt;ia::meta.totalCount of last page&gt;, &quot;hasMore&quot;: false}</code>. Guards: <code>MAX_PAGES = 1000</code> and stop-if-zero-progress, both returning <code>hasMore: true</code> on truncation (mirror <code>netsuite-cli/src/commands/record.rs::list</code>, lines 34–92).</li>
+<li><code>create</code>: <code>POST /objects/{object_path}</code> with <code>data</code> as body (object = single, array = batch; the API enforces the 500 cap). Headers: <code>(&quot;X-IA-API-Param-Transaction&quot;, &quot;true&quot;)</code> when <code>atomic</code>; <code>(&quot;Idempotency-Key&quot;, key)</code> when given. Response (200/201/202/207 envelope) passes through.</li>
+<li><code>update</code>: single (<code>key: Some</code>) → <code>PATCH /objects/{object_path}/{key}</code>; batch (<code>key: None</code>) → <code>PATCH /objects/{object_path}</code> and require <code>data</code> to be an array (<code>CliError::Usage(&quot;batch update requires --data to be a JSON array of objects each carrying its key&quot;)</code> otherwise). Same optional headers as create. Body passes through.</li>
+<li><code>delete</code>: <code>DELETE /objects/{object_path}/{keys}</code> → 204 empty → return <code>{&quot;deleted&quot;: true, &quot;keys&quot;: [&quot;…&quot;, …]}</code> (split on commas).</li>
+</ul>
+<p>CLI shapes (mirror the reference <code>RecordAction</code> enum style, with after_help examples):</p>
+<pre><code class="language-text">intacct-cli object get &lt;application/object&gt; &lt;key[,key...]&gt;
+intacct-cli object list &lt;application/object&gt; [--start N] [--size N] [--all]
+intacct-cli object create &lt;application/object&gt; --data &lt;json|@file|-&gt; [--atomic] [--idempotency-key K]
+intacct-cli object update &lt;application/object&gt; [&lt;key&gt;] --data ... [--atomic] [--idempotency-key K]
+intacct-cli object delete &lt;application/object&gt; &lt;key[,key...]&gt;
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests <code>tests/object_commands.rs</code></strong></li>
+</ul>
+<pre><code class="language-rust">mod common;
+
+use intacct_cli::commands::object;
+use serde_json::json;
+use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn get_fetches_by_path_and_key() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/accounts-payable/vendor/42&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            &quot;ia::result&quot;: {&quot;key&quot;: &quot;42&quot;, &quot;id&quot;: &quot;V-42&quot;, &quot;href&quot;: &quot;/objects/accounts-payable/vendor/42&quot;}
+        })))
+        .mount(&amp;server).await;
+    let result = object::get(&amp;common::client_for(&amp;server), &quot;accounts-payable/vendor&quot;, &quot;42&quot;).await.unwrap();
+    assert_eq!(result[&quot;ia::result&quot;][&quot;id&quot;], &quot;V-42&quot;);
+}
+
+#[tokio::test]
+async fn create_sends_atomic_and_idempotency_headers() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;POST&quot;)).and(path(&quot;/objects/accounts-payable/vendor&quot;))
+        .and(header(&quot;X-IA-API-Param-Transaction&quot;, &quot;true&quot;))
+        .and(header(&quot;Idempotency-Key&quot;, &quot;abc-123&quot;))
+        .and(body_json(json!([{&quot;id&quot;: &quot;V1&quot;}, {&quot;id&quot;: &quot;V2&quot;}])))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            &quot;ia::result&quot;: [{&quot;key&quot;: &quot;1&quot;}, {&quot;key&quot;: &quot;2&quot;}],
+            &quot;ia::meta&quot;: {&quot;totalCount&quot;: 2, &quot;totalSuccess&quot;: 2, &quot;totalError&quot;: 0}
+        })))
+        .mount(&amp;server).await;
+    let result = object::create(&amp;common::client_for(&amp;server), &quot;accounts-payable/vendor&quot;,
+        json!([{&quot;id&quot;: &quot;V1&quot;}, {&quot;id&quot;: &quot;V2&quot;}]), true, Some(&quot;abc-123&quot;.into())).await.unwrap();
+    assert_eq!(result[&quot;ia::meta&quot;][&quot;totalSuccess&quot;], 2);
+}
+
+#[tokio::test]
+async fn batch_update_without_array_data_is_a_usage_error() {
+    let server = MockServer::start().await;
+    let error = object::update(&amp;common::client_for(&amp;server), &quot;accounts-payable/vendor&quot;,
+        None, json!({&quot;id&quot;: &quot;V1&quot;}), false, None).await.unwrap_err();
+    assert!(matches!(error, intacct_cli::error::CliError::Usage(_)));
+}
+
+#[tokio::test]
+async fn delete_returns_synthesized_acknowledgment() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;DELETE&quot;)).and(path(&quot;/objects/accounts-payable/vendor/42,43&quot;))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&amp;server).await;
+    let result = object::delete(&amp;common::client_for(&amp;server), &quot;accounts-payable/vendor&quot;, &quot;42,43&quot;).await.unwrap();
+    assert_eq!(result, json!({&quot;deleted&quot;: true, &quot;keys&quot;: [&quot;42&quot;, &quot;43&quot;]}));
+}
+
+#[tokio::test]
+async fn list_all_merges_pages_following_next() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/general-ledger/account&quot;))
+        .and(query_param(&quot;start&quot;, &quot;1&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            &quot;ia::result&quot;: [{&quot;key&quot;: &quot;1&quot;}, {&quot;key&quot;: &quot;2&quot;}],
+            &quot;ia::meta&quot;: {&quot;totalCount&quot;: 3, &quot;start&quot;: 1, &quot;pageSize&quot;: 2, &quot;next&quot;: 3, &quot;previous&quot;: null}
+        })))
+        .mount(&amp;server).await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/general-ledger/account&quot;))
+        .and(query_param(&quot;start&quot;, &quot;3&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            &quot;ia::result&quot;: [{&quot;key&quot;: &quot;3&quot;}],
+            &quot;ia::meta&quot;: {&quot;totalCount&quot;: 3, &quot;start&quot;: 3, &quot;pageSize&quot;: 2, &quot;next&quot;: null, &quot;previous&quot;: 1}
+        })))
+        .mount(&amp;server).await;
+    let result = object::list(&amp;common::client_for(&amp;server), &quot;general-ledger/account&quot;,
+        Some(1), Some(2), true).await.unwrap();
+    assert_eq!(result[&quot;count&quot;], 3);
+    assert_eq!(result[&quot;hasMore&quot;], false);
+    assert_eq!(result[&quot;totalCount&quot;], 3);
+    assert_eq!(result[&quot;items&quot;].as_array().unwrap().len(), 3);
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure</strong> — <code>cargo test --test object_commands</code> → compile error.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Implement <code>src/commands/object.rs</code></strong> per the semantics above. The <code>--all</code> merge loop (shared shape with Task 9 — keep them separate per module, like the reference does):</li>
+</ul>
+<pre><code class="language-rust">const MAX_PAGES: u32 = 1000;
+
+pub async fn list(
+    client: &amp;IaClient,
+    object_path: &amp;str,
+    start: Option&lt;u64&gt;,
+    size: Option&lt;u64&gt;,
+    fetch_all: bool,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let mut next_start = start;
+    let mut merged_items: Vec&lt;Value&gt; = Vec::new();
+    let mut pages_fetched: u32 = 0;
+    let mut next_url: Option&lt;String&gt; = None;
+    loop {
+        let mut query: Vec&lt;(&amp;str, String)&gt; = Vec::new();
+        if let Some(start_row) = next_start {
+            query.push((&quot;start&quot;, start_row.to_string()));
+        }
+        if let Some(page_size) = size {
+            query.push((&quot;size&quot;, page_size.to_string()));
+        }
+        let path = next_url.take().unwrap_or_else(|| format!(&quot;/objects/{object_path}&quot;));
+        let response = client.request(reqwest::Method::GET, &amp;path, &amp;query, &amp;[], None).await?;
+        let page = response.body.unwrap_or(Value::Null);
+        if !fetch_all {
+            return Ok(page);
+        }
+        pages_fetched += 1;
+        let page_items = page[&quot;ia::result&quot;].as_array().cloned().unwrap_or_default();
+        let page_item_count = page_items.len();
+        merged_items.extend(page_items);
+        let total = page[&quot;ia::meta&quot;][&quot;totalCount&quot;].clone();
+
+        match &amp;page[&quot;ia::meta&quot;][&quot;next&quot;] {
+            Value::Null =&gt; {
+                return Ok(json!({
+                    &quot;items&quot;: merged_items, &quot;count&quot;: merged_items.len(),
+                    &quot;totalCount&quot;: total, &quot;hasMore&quot;: false,
+                }));
+            }
+            next_marker =&gt; {
+                if page_item_count == 0 || pages_fetched &gt;= MAX_PAGES {
+                    return Ok(json!({
+                        &quot;items&quot;: merged_items, &quot;count&quot;: merged_items.len(),
+                        &quot;totalCount&quot;: total, &quot;hasMore&quot;: true,
+                    }));
+                }
+                // `next` is a row number on query-style pages and may be a URL on
+                // list pages; support both.
+                if let Some(row) = next_marker.as_u64() {
+                    next_start = Some(row);
+                } else if let Some(url) = next_marker.as_str() {
+                    next_url = Some(url.to_string());
+                    next_start = None;
+                } else {
+                    return Err(CliError::Api {
+                        status: 200,
+                        message: format!(&quot;unrecognized ia::meta.next value: {next_marker}&quot;),
+                        details: vec![], support_id: None,
+                    });
+                }
+            }
+        }
+    }
+}
+</code></pre>
+<p><code>get</code>/<code>create</code>/<code>update</code>/<code>delete</code> are straightforward <code>client.request</code> calls per the semantics table; build the optional header slice as:</p>
+<pre><code class="language-rust">fn write_headers(atomic: bool, idempotency_key: &amp;Option&lt;String&gt;) -&gt; Vec&lt;(&amp;&#39;static str, &amp;str)&gt; { ... }
+</code></pre>
+<p>(headers passed as <code>&amp;[(&amp;str, &amp;str)]</code> — collect into a <code>Vec</code> and pass <code>.as_slice()</code>).</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 4: Wire <code>Command::Object</code>/<code>ObjectAction</code> into <code>src/cli.rs</code></strong> with <code>--data</code> flowing through <code>commands::read_data_arg</code>, and after_help examples on each variant, e.g. <code>intacct-cli object get accounts-payable/vendor 42</code>.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: Run to verify pass</strong> — <code>cargo test</code> → all green.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 6: fmt, clippy, commit</strong> — <code>&quot;feat: generic object CRUD commands&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 9: Query service</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/query.rs</code>; add module + <code>Command::Query</code> + dispatch arm</li>
+<li>Test: <code>tests/query_commands.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>IaClient</code>, <code>read_data_arg</code>.</li>
+<li>Produces:</li>
+</ul>
+<pre><code class="language-rust">pub struct QueryArgs {
+    pub object: String,
+    pub fields: Option&lt;String&gt;,            // csv
+    pub filters: Vec&lt;String&gt;,              // each a JSON object string, e.g. {&quot;$eq&quot;:{&quot;status&quot;:&quot;active&quot;}}
+    pub filter_expression: Option&lt;String&gt;,
+    pub order_by: Vec&lt;String&gt;,             // each a JSON object string, e.g. {&quot;id&quot;:&quot;asc&quot;}
+    pub start: Option&lt;u64&gt;,
+    pub size: Option&lt;u64&gt;,
+    pub as_of_date: Option&lt;String&gt;,
+    pub case_sensitive: bool,
+    pub include_private: bool,
+    pub include_hierarchy_fields: bool,
+}
+pub fn build_query_body(args: &amp;QueryArgs) -&gt; Result&lt;Value, CliError&gt;;    // pure, unit-tested
+pub async fn run(client: &amp;IaClient, body: Value, fetch_all: bool) -&gt; Result&lt;Value, CliError&gt;;
+</code></pre>
+<ul>
+<li><p><code>build_query_body</code> assembles the documented <code>POST /services/core/query</code> body: <code>object</code>; <code>fields</code> split on commas (required unless the caller used <code>--body</code>; missing → <code>CliError::Usage(&quot;--fields is required (comma-separated; aggregates like sum:amount allowed)&quot;)</code>); each <code>--filter</code> string parsed as JSON (parse error → Usage); <code>filterExpression</code>; <code>orderBy</code> array from parsed <code>--order-by</code> values; <code>filterParameters</code> object assembled only from the flags actually set (<code>asOfDate</code>, <code>caseSensitiveComparison</code>, <code>includePrivate</code>, <code>includeHierarchyFields</code>) and omitted entirely when none are; <code>start</code>; <code>size</code>.</p>
+</li>
+<li><p><code>run</code> POSTs <code>/services/core/query</code>. Without <code>--all</code>, page passes through. With <code>--all</code>: loop <code>body[&quot;start&quot;] = next</code> while <code>ia::meta.next</code> is a number, merging <code>ia::result</code> arrays, same <code>MAX_PAGES</code>/zero-progress guards and merged envelope as Task 8 (<code>{&quot;items&quot;,&quot;count&quot;,&quot;totalCount&quot;,&quot;hasMore&quot;}</code>).</p>
+</li>
+<li><p>CLI: <code>intacct-cli query &lt;object&gt; --fields k,id [--filter J]... [--filter-expression E] [--order-by J]... [--start N] [--size N] [--all] [--as-of-date D] [--case-sensitive] [--include-private] [--include-hierarchy-fields]</code> <strong>or</strong> <code>intacct-cli query --body &lt;json|@file|-&gt;</code> (mutually exclusive with the structured flags; enforce: if <code>--body</code> is given together with <code>--fields</code>/<code>--filter</code>/etc., return Usage error &quot;pass either --body or the structured flags, not both&quot;). <code>--all</code> works with both forms.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests</strong></p>
+</li>
+</ul>
+<p>Unit (inside <code>src/commands/query.rs</code>):</p>
+<pre><code class="language-rust">#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn base_args() -&gt; QueryArgs {
+        QueryArgs {
+            object: &quot;accounts-payable/vendor&quot;.into(),
+            fields: Some(&quot;key,id,vendor.creditLimit&quot;.into()),
+            filters: vec![], filter_expression: None, order_by: vec![],
+            start: None, size: None, as_of_date: None,
+            case_sensitive: false, include_private: false, include_hierarchy_fields: false,
+        }
+    }
+
+    #[test]
+    fn builds_minimal_body() {
+        let body = build_query_body(&amp;base_args()).unwrap();
+        assert_eq!(body, json!({
+            &quot;object&quot;: &quot;accounts-payable/vendor&quot;,
+            &quot;fields&quot;: [&quot;key&quot;, &quot;id&quot;, &quot;vendor.creditLimit&quot;],
+        }));
+    }
+
+    #[test]
+    fn builds_full_body_with_filters_ordering_and_parameters() {
+        let mut args = base_args();
+        args.filters = vec![r#&quot;{&quot;$eq&quot;:{&quot;status&quot;:&quot;active&quot;}}&quot;#.into(), r#&quot;{&quot;$contains&quot;:{&quot;name&quot;:&quot;Acme&quot;}}&quot;#.into()];
+        args.filter_expression = Some(&quot;1 and 2&quot;.into());
+        args.order_by = vec![r#&quot;{&quot;totalDue&quot;:&quot;asc&quot;}&quot;#.into()];
+        args.start = Some(1);
+        args.size = Some(100);
+        args.as_of_date = Some(&quot;2026-04-01&quot;.into());
+        args.case_sensitive = true;
+        let body = build_query_body(&amp;args).unwrap();
+        assert_eq!(body[&quot;filters&quot;], json!([{&quot;$eq&quot;:{&quot;status&quot;:&quot;active&quot;}}, {&quot;$contains&quot;:{&quot;name&quot;:&quot;Acme&quot;}}]));
+        assert_eq!(body[&quot;filterExpression&quot;], &quot;1 and 2&quot;);
+        assert_eq!(body[&quot;orderBy&quot;], json!([{&quot;totalDue&quot;:&quot;asc&quot;}]));
+        assert_eq!(body[&quot;filterParameters&quot;], json!({&quot;asOfDate&quot;:&quot;2026-04-01&quot;,&quot;caseSensitiveComparison&quot;:true}));
+        assert_eq!(body[&quot;start&quot;], 1);
+        assert_eq!(body[&quot;size&quot;], 100);
+    }
+
+    #[test]
+    fn invalid_filter_json_is_a_usage_error() {
+        let mut args = base_args();
+        args.filters = vec![&quot;status=active&quot;.into()];
+        assert!(matches!(build_query_body(&amp;args), Err(CliError::Usage(_))));
+    }
+
+    #[test]
+    fn missing_fields_is_a_usage_error() {
+        let mut args = base_args();
+        args.fields = None;
+        assert!(matches!(build_query_body(&amp;args), Err(CliError::Usage(_))));
+    }
+}
+</code></pre>
+<p>Integration (<code>tests/query_commands.rs</code>): mirror Task 8&#39;s <code>list_all_merges_pages_following_next</code> against <code>POST /services/core/query</code> — first response <code>ia::meta.next = 3</code> with 2 items (assert via <code>body_partial_json(json!({&quot;object&quot;:&quot;x/y&quot;,&quot;start&quot;:1}))</code> on the second call... use two mocks distinguished by <code>body_partial_json</code> on <code>start</code>), second response <code>next = null</code> with 1 item; assert merged <code>{&quot;count&quot;:3,&quot;hasMore&quot;:false}</code>. Plus a single-page pass-through test (no <code>--all</code>).</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure.</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Implement</strong> per the interface block; <code>run</code>&#39;s merge loop mutates <code>body[&quot;start&quot;]</code> between pages.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 4: Wire the CLI variant</strong> with the mutual-exclusion check and after_help:
+<code>intacct-cli query accounts-payable/vendor --fields key,id --filter &#39;{&quot;$eq&quot;:{&quot;status&quot;:&quot;active&quot;}}&#39; --all</code></li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: Run to verify pass; fmt, clippy, commit</strong> — <code>&quot;feat: query service command&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 10: Describe (model service) with cache</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/describe.rs</code>; add module + <code>Command::Describe</code> + dispatch arm</li>
+<li>Test: <code>tests/describe_commands.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>IaClient</code>, <code>default_cache_dir()</code>, <code>Config.cache_ttl_hours</code>.</li>
+<li>Produces:</li>
+</ul>
+<pre><code class="language-rust">pub async fn describe_resource(client: &amp;IaClient, name: &amp;str, full_schema: bool,
+                               cache_dir: &amp;Path, refresh: bool, cache_ttl: Duration)
+                               -&gt; Result&lt;Value, CliError&gt;;
+pub async fn list_resources(client: &amp;IaClient, resource_type: &amp;str, name_filter: Option&lt;String&gt;)
+                            -&gt; Result&lt;Value, CliError&gt;;
+</code></pre>
+<ul>
+<li><p><code>describe_resource</code>: <code>GET /services/core/model?name={name}&amp;schema={true|false}</code>. Response passes through, and is cached at <code>{cache_dir}/{sanitized}.{full|short}.json</code> where <code>sanitized</code> replaces <code>/</code> and <code>::</code> with <code>_</code> (e.g. <code>accounts-payable_vendor.full.json</code>). Cache honored unless <code>refresh</code> or stale (mtime older than TTL) — port the <code>read_fresh_cache</code> helper from <code>~/projects/creativeplanning/netsuite-cli/src/commands/describe.rs</code> (87 lines) exactly.</p>
+</li>
+<li><p><code>list_resources</code>: <code>GET /services/core/model?type={resource_type}</code> plus <code>filter={regex}</code> when given. Not cached (the list is cheap and changes with subscriptions). Passes through.</p>
+</li>
+<li><p>CLI: <code>intacct-cli describe &lt;application/object&gt; [--schema] [--refresh]</code> (<code>--schema</code> = full model; default short) or <code>intacct-cli describe --list [--type object|service|workflow] [--filter REGEX]</code> (<code>--type</code> defaults to <code>object</code>; requires <code>--list</code>). Positional name and <code>--list</code> are mutually exclusive; neither → Usage error <code>&quot;pass a resource name or --list&quot;</code>. Cache dir: <code>default_cache_dir().join(&quot;metadata&quot;).join(alias)</code> — dispatch passes it in; TTL = <code>cache_ttl_hours</code> (default 24) as <code>Duration</code>.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests <code>tests/describe_commands.rs</code></strong> — three tests: (a) <code>describe_fetches_and_caches</code> (mock <code>GET /services/core/model</code> with <code>query_param(&quot;name&quot;, &quot;accounts-payable/vendor&quot;)</code>, <code>query_param(&quot;schema&quot;, &quot;true&quot;)</code>, <code>.expect(1)</code>; call twice with a tempdir cache and 24h TTL; second call must hit the cache — the <code>.expect(1)</code> proves it); (b) <code>refresh_bypasses_cache</code> (same but second call passes <code>refresh = true</code>, mock <code>.expect(2)</code>); (c) <code>list_passes_type_and_filter</code> (<code>query_param(&quot;type&quot;, &quot;object&quot;)</code>, <code>query_param(&quot;filter&quot;, &quot;^accounts-payable/&quot;)</code>).</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure.</strong></p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 3: Implement</strong> (port + deltas above).</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 4: Wire CLI; run to verify pass.</strong></p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: describe command over the model service&quot;</code>.</p>
+</li>
+</ul>
+<hr>
+<h3>Task 11: Raw escape hatch</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/raw.rs</code>; add module + <code>Command::Raw</code> + dispatch arm</li>
+<li>Test: <code>tests/raw_commands.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>IaClient</code>, <code>parse_key_value_pairs</code>, <code>parse_header_pairs</code>, <code>read_data_arg</code>.</li>
+<li>Produces: <code>pub async fn call(client: &amp;IaClient, method: reqwest::Method, path: &amp;str, query: &amp;[(String,String)], headers: &amp;[(String,String)], body: Option&lt;Value&gt;) -&gt; Result&lt;Value, CliError&gt;</code> — returns the response body, or <code>{&quot;status&quot;: &lt;code&gt;}</code> when the body is empty (e.g. 204).</li>
+</ul>
+<p>Port <code>~/projects/creativeplanning/netsuite-cli/src/commands/raw.rs</code> (37 lines) and its <code>HttpMethodArg</code> ValueEnum (Get/Post/Put/Patch/Delete, case-insensitive) from the reference cli.rs. CLI: <code>intacct-cli raw &lt;METHOD&gt; &lt;path&gt; [--query k=v]... [--header &#39;Name: value&#39;]... [--data &lt;json|@file|-&gt;]</code> with after_help <code>intacct-cli raw GET /services/core/model --query type=service</code>.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests</strong> — (a) GET with <code>--query</code> pairs and a custom header reaches the mock and passes the body through; (b) 204 response yields <code>{&quot;status&quot;: 204}</code>.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure. Step 3: Implement. Step 4: Verify pass.</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: raw escape-hatch command&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 12: Auth-code + PKCE flow, loopback listener, account revoke</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/auth/loopback.rs</code>, <code>src/auth/authcode.rs</code> (declare both in <code>src/auth/mod.rs</code>: <code>pub mod authcode; pub(crate) mod loopback;</code>)</li>
+<li>Modify: <code>src/context.rs</code> (real AuthCode arm), <code>src/commands/account.rs</code> (auth-code add path, revoke, test --reauth), <code>src/cli.rs</code></li>
+<li>Test: <code>tests/authcode.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>TokenProvider</code>, <code>SecretStore</code>, <code>account::{authorize_url, token_url, revoke_url}</code>.</li>
+<li>Produces:</li>
+</ul>
+<pre><code class="language-rust">// authcode.rs
+pub struct LoginOptions { pub port: u16, pub paste: bool }   // port default 8899
+pub async fn run_login_flow(http: &amp;reqwest::Client, client_id: &amp;str, client_secret: &amp;str,
+                            options: LoginOptions) -&gt; Result&lt;TokenResponse, CliError&gt;;
+pub struct AuthCodeProvider { /* http, alias, token_url, store */ }
+impl AuthCodeProvider {
+    // client_id/client_secret/refresh_token live in the stored AccountSecrets::AuthCode
+    // and are read from the store at refresh time (they rotate together with the token).
+    pub fn new(http: reqwest::Client, alias: String, token_url: String,
+               store: Arc&lt;dyn SecretStore&gt;) -&gt; Self;
+}
+impl TokenProvider for AuthCodeProvider { ... }
+// pure helpers, unit-tested:
+pub fn pkce_pair() -&gt; (String, String);                       // (verifier, challenge)
+pub fn build_authorize_url(base_authorize_url: &amp;str, client_id: &amp;str, redirect_uri: &amp;str,
+                           state: &amp;str, challenge: &amp;str) -&gt; String;
+</code></pre>
+<p><strong><code>src/auth/loopback.rs</code>: copy <code>~/projects/creativeplanning/netsuite-cli/src/auth/loopback.rs</code> verbatim</strong> (211 lines; it is product-agnostic — one-shot HTTPS listener on <code>127.0.0.1:&lt;port&gt;</code> with a throwaway rcgen cert, 30s read / 300s overall timeouts, <code>/callback</code> only, echoes no query values, plus <code>read_pasted_redirect</code> for <code>--paste</code>). The only permitted edits: user-facing strings that say &quot;NetSuite&quot; (say &quot;Sage Intacct&quot;).</p>
+<p><strong><code>authcode.rs</code> implementation notes:</strong></p>
+<ul>
+<li><p><code>pkce_pair</code>: verifier = 64 random alphanumeric chars (<code>rand</code>); challenge = <code>base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier))</code>.</p>
+</li>
+<li><p><code>build_authorize_url</code>: <code>{authorize}?response_type=code&amp;client_id=..&amp;redirect_uri=..&amp;state=..&amp;scope=offline_access&amp;code_challenge=..&amp;code_challenge_method=S256</code> (use <code>url::Url</code> so encoding is correct).</p>
+</li>
+<li><p><code>run_login_flow</code>: generate pkce + random 32-hex <code>state</code>; redirect_uri = <code>https://localhost:{port}/callback</code>; print the URL to <strong>stderr</strong> and <code>webbrowser::open</code> (ignore open failure — the URL is printed); collect <code>code</code>+<code>state</code> via <code>loopback::wait_for_callback(port)</code> or <code>read_pasted_redirect()</code> when <code>paste</code>; reject mismatched state with <code>CliError::Auth(&quot;state mismatch — retry the login&quot;)</code>; exchange: POST token endpoint <strong>form-encoded</strong> <code>grant_type=authorization_code, code, redirect_uri, client_id, client_secret, code_verifier</code>; parse <code>TokenResponse</code>; a missing <code>refresh_token</code> is an error (<code>CliError::Auth(&quot;no refresh token returned — the authorize request must include scope=offline_access&quot;)</code>).</p>
+</li>
+<li><p><code>AuthCodeProvider::access_token</code>: cached-valid → return; else read <code>AccountSecrets::AuthCode</code>; <code>refresh_token</code> <code>None</code> → <code>CliError::Auth(&quot;no refresh token stored for &#39;&lt;alias&gt;&#39;; run </code>intacct-cli account add<code> again&quot;)</code>; POST form <code>grant_type=refresh_token, refresh_token, client_id, client_secret</code>; <strong>on success persist the rotated refresh token via <code>store.set</code> BEFORE caching/returning the access token</strong> (rotation loss = forced re-login; mirror the persistence-ordering care in <code>netsuite-cli/src/auth/authcode.rs</code>); 4xx from the token endpoint → <code>CliError::Auth(&quot;refresh failed (&lt;status&gt;): &lt;body&gt; — run </code>intacct-cli account add<code> to re-authenticate&quot;)</code>.</p>
+</li>
+<li><p><code>context.rs</code>: replace the placeholder AuthCode arm — build <code>AuthCodeProvider</code> from stored <code>AccountSecrets::AuthCode</code>.</p>
+</li>
+<li><p><code>commands/account.rs</code>:</p>
+<ul>
+<li><code>add</code> auth-code path: store config entry, run <code>run_login_flow</code>, store <code>AccountSecrets::AuthCode { client_id, client_secret, refresh_token: Some(...) }</code>. (<code>--user-id</code> not required; <code>--entity-id</code> recorded in config only — the header/<code>--entity</code> flag handles scoping at request time.)</li>
+<li><code>test --reauth</code> (auth-code only): re-run login flow and overwrite stored refresh token, then run the normal test call.</li>
+<li><code>revoke(config_path, store, alias, http, yes: bool)</code>: unless <code>yes</code>, require an interactive confirmation on stderr (<code>&quot;This revokes ALL Intacct API tokens for this user/company, not just this CLI&#39;s. Type the alias to confirm: &quot;</code>, read a line from stdin, must equal alias; non-interactive without <code>--yes</code> → Usage error). Mint/fetch a current access token via the account&#39;s provider, POST <code>revoke_url()</code> form-encoded <code>token=&lt;access_token&gt;</code>, expect <code>{&quot;revoked&quot;: true}</code>, then <code>store.delete_token(alias)</code>. Returns the revoke response.</li>
+<li>CLI: <code>account add ... --flow auth-code --client-id C [--port 8899] [--paste]</code>; <code>account revoke &lt;alias&gt; [--yes]</code>; <code>account test [--alias A] [--reauth] [--port 8899] [--paste]</code>.</li>
+</ul>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 1: Write failing unit tests</strong> (inside <code>src/auth/authcode.rs</code>): (a) <code>pkce_challenge_matches_reference_vector</code> — verifier <code>zWiRBuiUcmnIbPBCoNqA5cWDFuaEZwZ7jLJJGJ4P3NQ</code> must produce challenge <code>manPXpjp75EFeofO-YWtY3gIPp0S6_CJ-ciRJyYIonw</code> (the documented Intacct sample, URL-safe alphabet); (b) <code>authorize_url_contains_all_oauth_params</code> — parse with <code>url::Url</code> and assert the seven query params incl. <code>scope=offline_access</code>.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 2: Write failing integration tests <code>tests/authcode.rs</code></strong> (no browser — test the provider only): (a) <code>refresh_persists_rotated_token_before_returning</code> — mock <code>POST /oauth2/token</code> matching <code>body_string_contains(&quot;grant_type=refresh_token&quot;)</code> and <code>body_string_contains(&quot;refresh_token=OLD&quot;)</code>, responding <code>{access_token:&quot;A&quot;, refresh_token:&quot;NEW&quot;, expires_in: 28800}</code>; seed <code>MemoryStore</code> with <code>AuthCode { refresh_token: Some(&quot;OLD&quot;) }</code>; after <code>access_token()</code> returns <code>&quot;A&quot;</code>, assert the store now holds <code>refresh_token == Some(&quot;NEW&quot;)</code> and a cached token <code>&quot;A&quot;</code>; (b) <code>missing_refresh_token_is_auth_error_mentioning_account_add</code>; (c) <code>refresh_4xx_is_auth_error</code>.</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 3: Run to verify failure. Step 4: Copy loopback.rs; implement authcode.rs, context arm, account.rs additions, CLI wiring.</strong></p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 5: Run to verify pass</strong> — <code>cargo test</code> → all green (loopback&#39;s own inline tests from the reference come along with the copy).</p>
+</li>
+<li><p><input disabled="" type="checkbox"> <strong>Step 6: fmt, clippy, commit</strong> — <code>&quot;feat: auth-code PKCE flow with loopback listener and account revoke&quot;</code>.</p>
+</li>
+</ul>
+<hr>
+<h3>Task 13: Bulk service (<code>job</code>)</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/job.rs</code>; add module + <code>Command::Job { action: JobAction }</code> + dispatch arms</li>
+<li>Test: <code>tests/job_commands.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Consumes: <code>IaClient::request_multipart</code> (Task 6), <code>read_data_arg</code>.</li>
+<li>Produces:</li>
+</ul>
+<pre><code class="language-rust">pub async fn submit(client: &amp;IaClient, object_name: &amp;str, operation: &amp;str,
+                    data: Value, callback_url: Option&lt;String&gt;) -&gt; Result&lt;Value, CliError&gt;;
+pub async fn status(client: &amp;IaClient, job_id: &amp;str, download: bool) -&gt; Result&lt;Value, CliError&gt;;
+</code></pre>
+<p>Documented shape (<code>POST /services/bulk/job/create</code>, multipart/form-data):</p>
+<ul>
+<li>form part <code>ia::requestBody</code> (content-type <code>application/json</code>): <code>{&quot;objectName&quot;: &quot;&lt;application/object&gt;&quot;, &quot;operation&quot;: &quot;create|update|delete&quot;, &quot;jobFile&quot;: &quot;file&quot;, &quot;fileContentType&quot;: &quot;json&quot;, &quot;callbackURL&quot;: &quot;&lt;url or empty&gt;&quot;}</code> (omit <code>callbackURL</code> key when not given).</li>
+<li>form part <code>file</code>: the JSON array of objects, uploaded as a file part.</li>
+<li>Response: job info incl. a job ID — passes through.</li>
+<li><code>status</code>: <code>GET /services/bulk/job/status?jobId={id}&amp;download={bool}</code>; job states: <code>queued</code>, <code>processing</code>, <code>completed</code>, <code>failed</code>; <code>download=true</code> returns full per-operation results once completed. Passes through.</li>
+</ul>
+<p>In reqwest, build the form inside the closure handed to <code>request_multipart</code> (forms are consumed per attempt):</p>
+<pre><code class="language-rust">let request_body = serde_json::to_string(&amp;request_body_json).expect(&quot;serializable&quot;);
+let data_bytes = serde_json::to_vec(&amp;data).expect(&quot;serializable&quot;);
+let build_form = move || {
+    reqwest::multipart::Form::new()
+        .part(
+            &quot;ia::requestBody&quot;,
+            reqwest::multipart::Part::text(request_body.clone())
+                .mime_str(&quot;application/json&quot;)
+                .expect(&quot;static mime&quot;),
+        )
+        .part(
+            &quot;file&quot;,
+            reqwest::multipart::Part::bytes(data_bytes.clone())
+                .file_name(&quot;job.json&quot;)
+                .mime_str(&quot;application/json&quot;)
+                .expect(&quot;static mime&quot;),
+        )
+};
+</code></pre>
+<p>CLI: <code>intacct-cli job submit &lt;application/object&gt; &lt;create|update|delete&gt; --data &lt;json|@file|-&gt; [--callback-url U]</code> (operation as a <code>ValueEnum</code>); <code>intacct-cli job status &lt;jobId&gt;</code>; <code>intacct-cli job result &lt;jobId&gt;</code> (= <code>status</code> with <code>download=true</code>). <code>submit</code> requires <code>--data</code> to be a JSON array (<code>CliError::Usage(&quot;bulk jobs take a JSON array of objects&quot;)</code>).</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests <code>tests/job_commands.rs</code></strong></li>
+</ul>
+<pre><code class="language-rust">mod common;
+
+use intacct_cli::commands::job;
+use serde_json::json;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn submit_posts_multipart_with_request_body_and_file_parts() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;POST&quot;)).and(path(&quot;/services/bulk/job/create&quot;))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            &quot;ia::result&quot;: {&quot;jobId&quot;: &quot;88.JOB1&quot;}
+        })))
+        .expect(1)
+        .mount(&amp;server).await;
+    let result = job::submit(&amp;common::client_for(&amp;server), &quot;accounts-payable/vendor&quot;, &quot;create&quot;,
+        json!([{&quot;id&quot;: &quot;V1&quot;}]), None).await.unwrap();
+    assert_eq!(result[&quot;ia::result&quot;][&quot;jobId&quot;], &quot;88.JOB1&quot;);
+
+    // Verify the multipart body carried both parts.
+    let requests = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&amp;requests[0].body).to_string();
+    assert!(body.contains(r#&quot;name=&quot;ia::requestBody&quot;&quot;#), &quot;missing ia::requestBody part: {body}&quot;);
+    assert!(body.contains(r#&quot;&quot;objectName&quot;:&quot;accounts-payable/vendor&quot;&quot;#) || body.contains(r#&quot;&quot;objectName&quot; : &quot;accounts-payable/vendor&quot;&quot;#));
+    assert!(body.contains(r#&quot;name=&quot;file&quot;&quot;#), &quot;missing file part: {body}&quot;);
+    assert!(body.contains(r#&quot;[{&quot;id&quot;:&quot;V1&quot;}]&quot;#));
+    let content_type = requests[0].headers.get(&quot;content-type&quot;).unwrap().to_str().unwrap();
+    assert!(content_type.starts_with(&quot;multipart/form-data&quot;), &quot;got {content_type}&quot;);
+}
+
+#[tokio::test]
+async fn submit_rejects_non_array_data() {
+    let server = MockServer::start().await;
+    let error = job::submit(&amp;common::client_for(&amp;server), &quot;accounts-payable/vendor&quot;, &quot;create&quot;,
+        json!({&quot;id&quot;: &quot;V1&quot;}), None).await.unwrap_err();
+    assert!(matches!(error, intacct_cli::error::CliError::Usage(_)));
+}
+
+#[tokio::test]
+async fn status_passes_job_id_and_download_flag() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/services/bulk/job/status&quot;))
+        .and(query_param(&quot;jobId&quot;, &quot;88.JOB1&quot;))
+        .and(query_param(&quot;download&quot;, &quot;true&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            &quot;ia::result&quot;: {&quot;status&quot;: &quot;completed&quot;}
+        })))
+        .mount(&amp;server).await;
+    let result = job::status(&amp;common::client_for(&amp;server), &quot;88.JOB1&quot;, true).await.unwrap();
+    assert_eq!(result[&quot;ia::result&quot;][&quot;status&quot;], &quot;completed&quot;);
+}
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure</strong> (<code>request_multipart</code> from Task 6 already exists; only <code>job.rs</code> is missing).</li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Implement + wire CLI. Step 4: Verify pass.</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: bulk job commands&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 14: Composite and session-id</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/composite.rs</code>; add module + <code>Command::Composite</code> + <code>Command::SessionId</code> + dispatch arms</li>
+<li>Test: <code>tests/composite_commands.rs</code></li>
+</ul>
+<p><strong>Interfaces:</strong></p>
+<ul>
+<li>Produces:</li>
+</ul>
+<pre><code class="language-rust">pub async fn run(client: &amp;IaClient, sub_requests: Value) -&gt; Result&lt;Value, CliError&gt;;      // POST /services/core/composite
+pub async fn session_id(client: &amp;IaClient) -&gt; Result&lt;Value, CliError&gt;;                    // GET /services/core/session/id
+</code></pre>
+<p><strong>Path gotcha:</strong> the session-id endpoint is <code>/services/core/session/id</code> (two segments), not <code>session-id</code> — confirmed on the Sage reference page (<code>op-get-core-session-id</code>). Response: <code>ia::result: {sessionId, expiresIn}</code>.</p>
+<ul>
+<li><code>run</code>: validates <code>sub_requests</code> is a JSON array of 2–10 elements (documented bounds; otherwise <code>CliError::Usage(&quot;composite takes a JSON array of 2-10 sub-requests&quot;)</code>), POSTs it verbatim, passes the response through (each element of <code>ia::result</code> carries its own <code>ia::status</code>). Sub-request element shape (documented; goes in after_help): <code>{&quot;method&quot;: &quot;POST&quot;, &quot;path&quot;: &quot;/objects/...&quot;, &quot;body&quot;: {...}, &quot;resultReference&quot;: &quot;vendor&quot;, &quot;headers&quot;: {...}}</code> — later sub-requests may reference earlier results as <code>@{vendor.1.key}</code>.</li>
+<li><code>session_id</code>: plain GET, passes through (returns the XML-API session ID for the current Bearer token — the documented legacy escape hatch).</li>
+</ul>
+<p>CLI: <code>intacct-cli composite --data &lt;json|@file|-&gt;</code>; <code>intacct-cli session-id</code>.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests <code>tests/composite_commands.rs</code></strong> — (a) <code>composite_posts_array_and_passes_through</code> (mock <code>POST /services/core/composite</code> with <code>body_json</code> of a 2-element array, respond with the documented nested envelope, assert pass-through); (b) <code>composite_rejects_wrong_arity</code> (1 element and 11 elements → Usage); (c) <code>session_id_gets_the_service</code> (mock <code>GET /services/core/session/id</code> → <code>{&quot;ia::result&quot;: {&quot;sessionId&quot;: &quot;CkAU0b...&quot;, &quot;expiresIn&quot;: 3600}}</code>).</li>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure. Step 3: Implement + wire CLI. Step 4: Verify pass.</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: composite and session-id commands&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 15: Views, exports, and reports</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/view.rs</code>, <code>src/commands/export.rs</code>, <code>src/commands/report.rs</code>; add modules + <code>Command::{View, Export, Report}</code> + dispatch arms</li>
+<li>Modify: <code>src/client.rs</code> (add <code>request_binary</code>), <code>src/commands/query.rs</code> (no code change needed — <code>build_query_body</code> is already <code>pub</code> and is reused here)</li>
+<li>Test: <code>tests/view_commands.rs</code>, <code>tests/export_commands.rs</code>, <code>tests/report_commands.rs</code></li>
+</ul>
+<p><strong>Scope note (spec §3 deviation, surfaced during endpoint research):</strong> Intacct models <strong>schedules</strong> (<code>core/schedule</code>, <code>core/scheduled-operation</code>) and <strong>user views</strong> (<code>core/user-view</code>) as ordinary objects — full CRUD already works through <code>intacct-cli object</code>, so no dedicated <code>schedule</code> command is built and <code>view</code> only adds what the object command can&#39;t do (executing views, listing system views). This is recorded in the SKILL.md gotchas (Task 17) and gets called out for user sign-off at plan review.</p>
+<p><strong>Interfaces:</strong></p>
+<pre><code class="language-rust">// client.rs addition — for endpoints whose success body is a file, not JSON
+pub struct BinaryResponse { pub status: u16, pub bytes: Vec&lt;u8&gt;, pub content_type: Option&lt;String&gt; }
+impl IaClient {
+    pub async fn request_binary(&amp;self, method: reqwest::Method, path: &amp;str,
+                                query: &amp;[(&amp;str, String)], body: Option&lt;&amp;Value&gt;)
+                                -&gt; Result&lt;BinaryResponse, CliError&gt;;
+    // Same auth/retry semantics as request(); on non-2xx the body is parsed as JSON
+    // and mapped through the same api_error().
+}
+
+// view.rs
+pub async fn run(client: &amp;IaClient, view_key: &amp;str, view_type: &amp;str,   // &quot;system&quot; | &quot;user&quot;
+                 start: Option&lt;u64&gt;, size: Option&lt;u64&gt;) -&gt; Result&lt;Value, CliError&gt;;
+pub async fn list_system_views(client: &amp;IaClient, object_name: &amp;str) -&gt; Result&lt;Value, CliError&gt;;
+
+// export.rs
+pub async fn run(client: &amp;IaClient, file_type: &amp;str, query_body: Value, output_path: &amp;Path)
+                 -&gt; Result&lt;Value, CliError&gt;;
+
+// report.rs
+pub async fn run(client: &amp;IaClient, report_id: &amp;str, output_type: &amp;str, output_location: &amp;str) -&gt; Result&lt;Value, CliError&gt;;
+pub async fn status(client: &amp;IaClient, report_id: &amp;str, output_type: &amp;str, output_location: &amp;str) -&gt; Result&lt;Value, CliError&gt;;
+pub async fn download(client: &amp;IaClient, report_id: &amp;str, output_type: &amp;str, output_path: &amp;Path) -&gt; Result&lt;Value, CliError&gt;;
+pub async fn cancel(client: &amp;IaClient, report_id: &amp;str, output_type: &amp;str, output_location: &amp;str) -&gt; Result&lt;Value, CliError&gt;;
+</code></pre>
+<p>Endpoint facts (from the Sage reference pages, captured to the scratchpad as <code>op-*.md</code>):</p>
+<ul>
+<li><strong>View execute:</strong> <code>POST /services/core/view</code>, body <code>{&quot;key&quot;: K, &quot;viewType&quot;: &quot;system&quot;|&quot;user&quot;, &quot;start&quot;?, &quot;size&quot;? (max 4000)}</code>. System-view keys look like <code>expenses/employee-expense::systemfw1</code>; user-view keys are numeric strings. Response = rows under <code>ia::result</code> + paging meta — passes through.</li>
+<li><strong>System-view catalog:</strong> <code>GET /objects/core/system-view?name=&lt;application/object&gt;</code> (all views for the object) or <code>?name=&lt;application/object&gt;::&lt;viewID&gt;</code> (one). Passes through.</li>
+<li><strong>Export:</strong> <code>POST /services/core/export</code>, body <code>{&quot;fileType&quot;: &quot;pdf&quot;|&quot;csv&quot;|&quot;word&quot;|&quot;xml&quot;|&quot;xlsx&quot;, &quot;query&quot;: &lt;exact same query grammar as /services/core/query&gt;}</code>. <strong>Success body is the binary file</strong> (content type matches fileType). <code>export::run</code> writes bytes to <code>output_path</code> and returns <code>{&quot;written&quot;: &lt;path&gt;, &quot;bytes&quot;: n, &quot;contentType&quot;: ct}</code>.</li>
+<li><strong>Reports</strong> (stored/memorized reports only — Intacct has no REST endpoint to execute an arbitrary report definition; <code>reports/interactive-custom-report</code> is definition CRUD, reachable via <code>object</code>):<ul>
+<li>run: <code>POST /services/reports/stored-reports</code> body <code>{&quot;reportId&quot;, &quot;outputType&quot;: &quot;html|pdf|csv|excel|text|fec|zip&quot;, &quot;outputLocation&quot;: &quot;intacct&quot;|&quot;cloud&quot;}</code> → <code>ia::result.status = &quot;submitted&quot;</code>, passes through.</li>
+<li>status: <code>GET /services/reports/status?reportId=..&amp;outputType=..&amp;outputLocation=..</code> → <code>status: pending|completed|failed|canceled</code> + <code>downloadURL</code> when completed; passes through.</li>
+<li>download: <code>GET /services/reports/download?reportId=..&amp;outputType=..</code> → <strong>binary</strong>; same write-to-file result shape as export.</li>
+<li>cancel: <code>POST /services/reports/cancel</code> body <code>{reportId, outputType, outputLocation}</code>; only queued reports can be canceled; passes through.</li>
+</ul>
+</li>
+</ul>
+<p>CLI shapes:</p>
+<pre><code class="language-text">intacct-cli view run &lt;key&gt; --view-type &lt;system|user&gt; [--start N] [--size N]
+intacct-cli view list &lt;application/object&gt;
+intacct-cli export &lt;application/object&gt; --file-type &lt;pdf|csv|word|xml|xlsx&gt; --output &lt;path&gt;
+    --fields ... [--filter J]... [--filter-expression E] [--order-by J]... [--start N] [--size N]
+    (or --body &lt;json|@file|-&gt; carrying the full query body; same mutual exclusion as `query`)
+intacct-cli report run &lt;reportId&gt; --output-type &lt;html|pdf|csv|excel|text|fec|zip&gt; [--output-location intacct|cloud]   # default intacct
+intacct-cli report status &lt;reportId&gt; --output-type T [--output-location L]
+intacct-cli report download &lt;reportId&gt; --output-type T --output &lt;path&gt;
+intacct-cli report cancel &lt;reportId&gt; --output-type T [--output-location L]
+</code></pre>
+<p><code>export</code> reuses Task 9&#39;s <code>QueryArgs</code>/<code>build_query_body</code> for the <code>query</code> member (factor the clap flags into a shared <code>#[derive(clap::Args)] struct QueryFlags</code> used by both the <code>Query</code> and <code>Export</code> variants). <code>--output</code> is required for <code>export</code> and <code>report download</code>; refuse to overwrite an existing file (<code>CliError::Usage(&quot;output file already exists: &lt;path&gt;&quot;)</code>).</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests</strong></li>
+</ul>
+<p><code>tests/view_commands.rs</code>:</p>
+<pre><code class="language-rust">mod common;
+
+use intacct_cli::commands::view;
+use serde_json::json;
+use wiremock::matchers::{body_json, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn run_posts_key_and_view_type() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;POST&quot;)).and(path(&quot;/services/core/view&quot;))
+        .and(body_json(json!({&quot;key&quot;: &quot;expenses/employee-expense::systemfw1&quot;, &quot;viewType&quot;: &quot;system&quot;, &quot;size&quot;: 10})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            &quot;ia::result&quot;: [{&quot;key&quot;: &quot;1&quot;}], &quot;ia::meta&quot;: {&quot;totalCount&quot;: 1, &quot;next&quot;: null}
+        })))
+        .mount(&amp;server).await;
+    let result = view::run(&amp;common::client_for(&amp;server),
+        &quot;expenses/employee-expense::systemfw1&quot;, &quot;system&quot;, None, Some(10)).await.unwrap();
+    assert_eq!(result[&quot;ia::meta&quot;][&quot;totalCount&quot;], 1);
+}
+
+#[tokio::test]
+async fn list_system_views_passes_object_name() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;GET&quot;)).and(path(&quot;/objects/core/system-view&quot;))
+        .and(query_param(&quot;name&quot;, &quot;accounts-payable/vendor&quot;))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({&quot;ia::result&quot;: []})))
+        .expect(1)
+        .mount(&amp;server).await;
+    view::list_system_views(&amp;common::client_for(&amp;server), &quot;accounts-payable/vendor&quot;).await.unwrap();
+}
+</code></pre>
+<p><code>tests/export_commands.rs</code>:</p>
+<pre><code class="language-rust">mod common;
+
+use intacct_cli::commands::export;
+use serde_json::json;
+use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn export_writes_binary_response_to_file() {
+    let server = MockServer::start().await;
+    Mock::given(method(&quot;POST&quot;)).and(path(&quot;/services/core/export&quot;))
+        .and(body_partial_json(json!({&quot;fileType&quot;: &quot;csv&quot;, &quot;query&quot;: {&quot;object&quot;: &quot;accounts-payable/vendor&quot;}})))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header(&quot;content-type&quot;, &quot;text/csv&quot;)
+            .set_body_bytes(b&quot;id,name\nV1,Acme\n&quot;.to_vec()))
+        .mount(&amp;server).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join(&quot;vendors.csv&quot;);
+    let query_body = json!({&quot;object&quot;: &quot;accounts-payable/vendor&quot;, &quot;fields&quot;: [&quot;id&quot;, &quot;name&quot;]});
+    let result = export::run(&amp;common::client_for(&amp;server), &quot;csv&quot;, query_body, &amp;output).await.unwrap();
+    assert_eq!(result[&quot;bytes&quot;], 16);
+    assert_eq!(std::fs::read_to_string(&amp;output).unwrap(), &quot;id,name\nV1,Acme\n&quot;);
+}
+
+#[tokio::test]
+async fn export_refuses_to_overwrite() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join(&quot;exists.csv&quot;);
+    std::fs::write(&amp;output, &quot;old&quot;).unwrap();
+    let error = export::run(&amp;common::client_for(&amp;server), &quot;csv&quot;, json!({&quot;object&quot;: &quot;x/y&quot;, &quot;fields&quot;: [&quot;id&quot;]}), &amp;output)
+        .await.unwrap_err();
+    assert!(matches!(error, intacct_cli::error::CliError::Usage(_)));
+}
+</code></pre>
+<p><code>tests/report_commands.rs</code>: (a) <code>run_submits_stored_report</code> — <code>POST /services/reports/stored-reports</code> with <code>body_json({&quot;reportId&quot;:&quot;1&quot;,&quot;outputType&quot;:&quot;pdf&quot;,&quot;outputLocation&quot;:&quot;intacct&quot;})</code> → pass-through of <code>{&quot;ia::result&quot;:{&quot;status&quot;:&quot;submitted&quot;}}</code>; (b) <code>status_sends_all_three_query_params</code>; (c) <code>download_writes_binary</code> (mirror the export binary test against <code>GET /services/reports/download</code> with <code>query_param(&quot;reportId&quot;,&quot;1&quot;)</code>, <code>query_param(&quot;outputType&quot;,&quot;pdf&quot;)</code>); (d) <code>cancel_posts_body</code>.</p>
+<p>Also add to <code>tests/client.rs</code>: <code>request_binary_maps_error_bodies</code> — a 422 with an <code>ia::error</code> JSON body through <code>request_binary</code> must produce the same <code>CliError::Api</code> as <code>request</code> does.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure.</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Implement</strong> <code>request_binary</code> (same loop as <code>request</code>, but <code>response.bytes()</code> on success; on non-2xx read text → <code>api_error</code>), then the three command modules; wire CLI with the shared <code>QueryFlags</code>.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 4: Run to verify pass</strong> — <code>cargo test</code> all green.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: view, export, and report commands&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 16: Config command</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/config_cmd.rs</code>; add module + <code>Command::Config</code> + dispatch arm</li>
+<li>Test: <code>tests/config_cmd.rs</code></li>
+</ul>
+<p>Port <code>~/projects/creativeplanning/netsuite-cli/src/commands/config_cmd.rs</code> (62 lines — read it) with the same two settable keys (<code>VALID_KEYS = [&quot;default_account&quot;, &quot;cache_ttl_hours&quot;]</code>): <code>get(config_path, key: Option&lt;&amp;str&gt;)</code> returns the whole effective config (with <code>cache_ttl_hours</code> defaulted to 24) or one key; <code>set(config_path, key, value)</code> validates — <code>default_account</code> must name an existing alias, <code>cache_ttl_hours</code> must parse as <code>u64</code> — and saves. CLI: <code>intacct-cli config get [KEY]</code>, <code>intacct-cli config set &lt;KEY&gt; &lt;VALUE&gt;</code>.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests <code>tests/config_cmd.rs</code></strong> — (a) <code>set_default_account_validates_alias_exists</code> (unknown alias → Usage error; known alias persists and <code>get(&quot;default_account&quot;)</code> returns it — seed the config file via <code>account::add</code> with a <code>MemoryStore</code>); (b) <code>set_cache_ttl_rejects_non_numeric</code>; (c) <code>get_without_key_returns_effective_config_with_defaults</code>.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure. Step 3: Implement (port). Step 4: Verify pass.</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: config get/set command&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 17: Agent skill (SKILL.md + skill install)</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>skills/intacct-cli/SKILL.md</code>, <code>src/commands/skill.rs</code>; add module + <code>Command::Skill</code> + dispatch arm</li>
+<li>Create: <code>.gitattributes</code> (now, so the embedded skill stays LF on Windows): <code>* text=auto eol=lf</code></li>
+<li>Test: <code>tests/skill_commands.rs</code></li>
+</ul>
+<p><strong><code>src/commands/skill.rs</code>:</strong> port <code>~/projects/creativeplanning/netsuite-cli/src/commands/skill.rs</code> (152 lines — read it) with every occurrence of <code>netsuite-cli</code> replaced by <code>intacct-cli</code>. Same behavior: <code>SKILL_MD = include_str!(&quot;../../skills/intacct-cli/SKILL.md&quot;)</code>; target dir = <code>--dir</code> override → <code>$CLAUDE_CONFIG_DIR</code> → <code>~/.claude</code>, under <code>skills/intacct-cli/SKILL.md</code>; skip (with <code>{&quot;installed&quot;: false, &quot;reason&quot;: ...}</code>) when the target or its parent is a symlink, when content is already current, or when no config dir resolves; returns <code>{&quot;skill&quot;,&quot;path&quot;,&quot;installed&quot;,&quot;reason&quot;?}</code>.</p>
+<p><strong><code>skills/intacct-cli/SKILL.md</code></strong> — write exactly:</p>
+<pre><code class="language-markdown">---
+name: intacct-cli
+description: Use when a task needs Sage Intacct data or metadata from the command line — reading or writing objects, running queries, discovering schemas, bulk/composite operations, or any Intacct REST API call. Covers picking the right subcommand, bootstrapping an account, recipes, and triaging errors by exit code.
+---
+
+# intacct-cli
+
+Single-binary CLI for the Sage Intacct REST API. stdout is always exactly one JSON
+value; errors are JSON on stderr. Add `--pretty` for humans.
+
+## Pick the right command
+
+| You need | Command |
+| --- | --- |
+| One object by key (or comma-list) | `intacct-cli object get &lt;application/object&gt; &lt;key[,key...]&gt;` |
+| Filtered/field-selected reads (the workhorse) | `intacct-cli query &lt;application/object&gt; --fields ... [--filter ...]` |
+| Cheap key/id listing | `intacct-cli object list &lt;application/object&gt; [--all]` |
+| Create / update / delete | `intacct-cli object create|update|delete ...` |
+| An object&#39;s fields, types, relationships | `intacct-cli describe &lt;application/object&gt;` |
+| What objects/services exist | `intacct-cli describe --list [--type object|service|workflow] [--filter REGEX]` |
+| &gt;500 records in one shot | `intacct-cli job submit ...` (async bulk) |
+| Several calls in one round trip | `intacct-cli composite --data &#39;[...]&#39;` |
+| Run a saved system/user view | `intacct-cli view run ...` |
+| Export filtered data | `intacct-cli export ...` |
+| Anything without a dedicated command | `intacct-cli raw &lt;METHOD&gt; &lt;path&gt; ...` |
+
+Object paths are `application/object` (`accounts-payable/vendor`, `general-ledger/journal-entry`),
+document types are `application/document::Name` (quote it), custom objects are
+`platform-apps/nsp::name`.
+
+## Bootstrap (once per machine)
+
+```bash
+export INTACCT_CLI_CLIENT_SECRET=&#39;&lt;secret&gt;&#39;   # or omit to be prompted interactively
+intacct-cli account add prod --company-id &lt;companyId&gt; --flow client-credentials \
+  --client-id &lt;clientId&gt; --user-id &lt;webServicesUserId&gt;
+intacct-cli account test        # verifies credentials end-to-end
+```
+
+First account added becomes the default; select others with `--account &lt;alias&gt;` or
+`$INTACCT_ACCOUNT`. Prereqs (admin, once per company): a Web Services user, and the
+app&#39;s client ID authorized under Company &gt; Setup &gt; Company &gt; Security &gt; Authorized
+Client Applications.
+
+## Recipes
+
+- **Discover before writing.** `intacct-cli describe accounts-payable/bill --schema` shows
+  required fields, enum values, `isReadOnly` (never send those), and owned-object shapes.
+- **Query paging:** `--size` max 4000; `--all` merges every page into
+  `{items, count, totalCount, hasMore}`.
+- **Filters** are JSON, repeatable, combined with `--filter-expression &quot;(1 and 2) or 3&quot;`:
+  `--filter &#39;{&quot;$eq&quot;:{&quot;status&quot;:&quot;active&quot;}}&#39; --filter &#39;{&quot;$contains&quot;:{&quot;name&quot;:&quot;Acme&quot;}}&#39;`
+  Operators: $eq $ne $lt $lte $gt $gte $in $notIn $between $notBetween $contains
+  $notContains $startsWith $notStartsWith $endsWith $notEndsWith.
+- **Aggregates** go in --fields: `--fields &#39;count:key,sum:totalDue&#39;`.
+- **Batch writes:** pass a JSON array to `object create`/`update` (max 500; add `--atomic`
+  for all-or-nothing). Batch update items each carry their own `key`.
+- **Idempotent writes:** `--idempotency-key &lt;uuid&gt;` on create/update (POST/PATCH only).
+- **Multi-entity:** `--entity &lt;entityId&gt;` on any command scopes the request via the
+  X-IA-API-Param-Entity header.
+- **Owned objects** (bill lines etc.) are written through their owner in one atomic call —
+  include the `lines` array in the bill body.
+
+## Errors: exit code → action
+
+| Exit | kind | Action |
+| --- | --- | --- |
+| 1 | api | Read `message` + `details[]`; quote `supportId` when contacting Sage support. 422 = business-logic validation; fix the payload. |
+| 2 | usage | Bad flags/arguments — fix the invocation. |
+| 3 | auth | Token/credential problem. `intacct-cli account test`; re-add the account if refresh is lost. |
+| 4 | network | Transport failure after retries — check connectivity and retry. |
+
+## Gotchas
+
+- stdout is ALWAYS one JSON value; parse it, never scrape stderr.
+- Success bodies keep Intacct&#39;s envelopes: results under `ia::result`, paging under `ia::meta`.
+- `account revoke` kills ALL tokens for that user/company (not just this CLI&#39;s) — use only
+  for real security events.
+- Request bodies max 1 MB; batch ops max 500; query pages max 4000 rows.
+- The tenant lives in the OAuth username (`user@company|entity`), not the URL — there is
+  one global API host.
+- GET list endpoints return key/id/href-level rows only; use `query` for real field access.
+- Schedules (`core/schedule`, `core/scheduled-operation`), user views (`core/user-view`), and
+  report definitions (`reports/interactive-custom-report`) are plain objects — manage them
+  with `object` CRUD. `view run` executes views; `report run` regenerates stored reports.
+</code></pre>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write failing tests <code>tests/skill_commands.rs</code></strong> — port the reference test shapes: (a) <code>install_writes_skill_into_dir_override</code> (tempdir; assert file exists at <code>&lt;dir&gt;/skills/intacct-cli/SKILL.md</code> and content equals the embedded string, <code>installed == true</code>); (b) <code>install_skips_when_content_current</code> (run twice; second returns <code>installed == false</code>); (c) <code>embedded_skill_has_frontmatter_name</code> (embedded string starts with <code>---</code> and contains <code>name: intacct-cli</code>).</li>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Run to verify failure. Step 3: Implement (port + SKILL.md above). Step 4: Verify pass.</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 5: fmt, clippy, commit</strong> — <code>&quot;feat: embedded agent skill and skill install command&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 18: Self-update</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>src/commands/update.rs</code>; add module + <code>Command::Update</code> + dispatch arm</li>
+<li>Test: unit only (network-free)</li>
+</ul>
+<p>Port <code>~/projects/creativeplanning/netsuite-cli/src/commands/update.rs</code> (165 lines — read it) with <code>REPO_OWNER = &quot;CreativePlanningBusinessServices&quot;</code>, <code>REPO_NAME = &quot;intacct-cli&quot;</code>, <code>bin_name = &quot;intacct-cli&quot;</code>. Same shape: runs <code>self_update</code> on <code>tokio::task::spawn_blocking</code>; reads <code>GITHUB_TOKEN</code> env for the private repo; strips leading <code>v</code> when comparing versions; <code>--check</code> returns <code>{current, latest, updateAvailable}</code> without swapping; after a successful swap re-execs the NEW binary&#39;s <code>skill install</code> (unless <code>--no-skill</code>) so the refreshed skill matches. CLI: <code>intacct-cli update [--check] [--no-skill]</code>.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Port the file and its inline unit tests</strong> (version-comparison helpers). Any test in the reference that hits GitHub stays out; only pure helpers get tests.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 2: <code>cargo test</code> green; <code>cargo run -- update --check</code> errors cleanly without <code>GITHUB_TOKEN</code> (acceptable: kind <code>api</code>/<code>network</code> message mentioning GitHub).</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: fmt, clippy, commit</strong> — <code>&quot;feat: self-update from GitHub releases&quot;</code>.</li>
+</ul>
+<hr>
+<h3>Task 19: CI, release, live smoke, README</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>.github/workflows/ci.yml</code>, <code>.github/workflows/release.yml</code>, <code>tests/live_smoke.rs</code></li>
+<li>Modify: <code>README.md</code></li>
+</ul>
+<p><strong>Workflows:</strong> copy <code>~/projects/creativeplanning/netsuite-cli/.github/workflows/ci.yml</code> and <code>release.yml</code> verbatim, replacing every <code>netsuite-cli</code> with <code>intacct-cli</code>. That yields: CI = test matrix (macos-latest, windows-latest, ubuntu-latest) running <code>cargo test --locked</code> plus a lint job (<code>cargo fmt --check</code>, <code>cargo clippy --all-targets -- -D warnings</code>) on push+PR; release = on <code>v*</code> tags, builds <code>aarch64-apple-darwin</code>, <code>x86_64-apple-darwin</code>, <code>x86_64-pc-windows-msvc</code>, zips as <code>intacct-cli-&lt;tag&gt;-&lt;target&gt;.zip</code>, publishes with <code>softprops/action-gh-release</code>.</p>
+<p><strong><code>tests/live_smoke.rs</code>:</strong></p>
+<pre><code class="language-rust">//! Real-API smoke tests. Excluded from CI (all #[ignore]).
+//! Run: INTACCT_LIVE_ALIAS=&lt;alias&gt; cargo test --test live_smoke -- --ignored --nocapture
+use intacct_cli::commands::{describe, object, query};
+use intacct_cli::context::context_for;
+
+fn live_alias() -&gt; String {
+    std::env::var(&quot;INTACCT_LIVE_ALIAS&quot;).expect(&quot;set INTACCT_LIVE_ALIAS to a configured account alias&quot;)
+}
+
+#[tokio::test]
+#[ignore]
+async fn model_service_lists_objects() {
+    let context = context_for(Some(&amp;live_alias()), None).unwrap();
+    let result = describe::list_resources(&amp;context.client, &quot;object&quot;, Some(&quot;^accounts-payable/&quot;.into()))
+        .await
+        .unwrap();
+    println!(&quot;{result}&quot;);
+}
+
+#[tokio::test]
+#[ignore]
+async fn query_reads_vendors() {
+    let context = context_for(Some(&amp;live_alias()), None).unwrap();
+    let body = serde_json::json!({
+        &quot;object&quot;: &quot;accounts-payable/vendor&quot;,
+        &quot;fields&quot;: [&quot;key&quot;, &quot;id&quot;, &quot;name&quot;],
+        &quot;size&quot;: 5
+    });
+    let result = query::run(&amp;context.client, body, false).await.unwrap();
+    println!(&quot;{result}&quot;);
+}
+
+#[tokio::test]
+#[ignore]
+async fn object_list_pages() {
+    let context = context_for(Some(&amp;live_alias()), None).unwrap();
+    let result = object::list(&amp;context.client, &quot;general-ledger/account&quot;, None, Some(5), false)
+        .await
+        .unwrap();
+    println!(&quot;{result}&quot;);
+}
+</code></pre>
+<p><strong><code>README.md</code>:</strong> replace the scaffold README with: what it is (one paragraph), install (download release zip / <code>cargo install --path .</code>), bootstrap (same snippet as the skill), command overview table (the SKILL.md decision table), exit codes, development (test/fmt/clippy commands, live smoke instructions, release procedure <code>git tag vX.Y.Z &amp;&amp; git push --tags</code>), and a pointer to <code>docs/superpowers/specs/2026-07-16-intacct-cli-design.html</code>. Keep the Basecamp task link.</p>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Step 1: Write both workflows + live_smoke.rs + README.</strong></li>
+<li><input disabled="" type="checkbox"> <strong>Step 2: Verify locally:</strong> <code>cargo test --locked</code> green (live_smoke compiles but is ignored), <code>cargo fmt --check</code> clean, <code>cargo clippy --all-targets -- -D warnings</code> clean.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 3: Commit</strong> — <code>&quot;chore: CI, release workflow, live smoke tests, README&quot;</code>.</li>
+<li><input disabled="" type="checkbox"> <strong>Step 4: Push the branch and confirm the CI workflow passes on GitHub</strong> (<code>git push -u origin feature/518814675-intacct-cli</code>, then <code>gh run watch</code>).</li>
+</ul>
+<hr>
+<h2>Verification sweep (after all tasks)</h2>
+<ul>
+<li><input disabled="" type="checkbox"> <code>cargo test --locked</code> — full suite green.</li>
+<li><input disabled="" type="checkbox"> <code>cargo run -- --help</code> lists: account, object, query, describe, job, composite, view, export, report, session-id, raw, config, skill, update.</li>
+<li><input disabled="" type="checkbox"> <code>cargo run -- object get accounts-payable/vendor 1</code> with no account configured → JSON usage error on stderr, exit 2 (<code>echo $?</code>).</li>
+<li><input disabled="" type="checkbox"> <code>cargo run -- skill install --dir /tmp/skilltest</code> writes the skill; <code>jq .</code> parses every command&#39;s stdout.</li>
+<li><input disabled="" type="checkbox"> Spec coverage re-check against <code>docs/superpowers/specs/2026-07-16-intacct-cli-design.html</code> §3 command table — every row implemented or explicitly deferred with the user&#39;s sign-off.</li>
+</ul>
+<div class="decision-panel">
+  <h3>Decision: how should we execute this plan?</h3>
+  <a class="btn btn-primary" href="http://127.0.0.1:8137/pick?c=subagent&amp;l=Subagent-driven" target="_blank">Subagent-driven (recommended) — fresh subagent per task, review between tasks</a>
+  <a class="btn btn-secondary" href="http://127.0.0.1:8137/pick?c=inline&amp;l=Inline" target="_blank">Inline — execute in this session with checkpoints</a>
+  <a class="btn btn-secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request+changes" target="_blank">I have changes — I'll describe them in chat</a>
+</div>
+</body>
+</html>
