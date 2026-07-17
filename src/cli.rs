@@ -1,8 +1,9 @@
 use std::io::IsTerminal;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{self, account, object, query};
+use crate::commands::{self, account, describe, object, query};
 use crate::config::AuthFlow;
 use crate::context::context_for;
 use crate::error::CliError;
@@ -81,6 +82,47 @@ pub enum Command {
         #[arg(long)]
         body: Option<String>,
     },
+    /// Look up model metadata for an object/service/workflow, or list what's available
+    #[command(
+        after_help = "Examples:\n  intacct-cli describe accounts-payable/vendor --schema\n  intacct-cli describe --list --type object --filter '^accounts-payable/'"
+    )]
+    Describe {
+        /// Resource name, e.g. accounts-payable/vendor (omit when --list is given)
+        #[arg(conflicts_with = "list")]
+        name: Option<String>,
+        /// Return the full schema instead of the short model summary
+        #[arg(long)]
+        schema: bool,
+        /// Bypass the local metadata cache
+        #[arg(long)]
+        refresh: bool,
+        /// List available resources instead of describing one
+        #[arg(long)]
+        list: bool,
+        /// Resource type to list; only valid with --list
+        #[arg(long, value_enum, default_value = "object", requires = "list")]
+        r#type: ResourceType,
+        /// Regex filtering the listed resource names; only valid with --list
+        #[arg(long, requires = "list")]
+        filter: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ResourceType {
+    Object,
+    Service,
+    Workflow,
+}
+
+impl ResourceType {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResourceType::Object => "object",
+            ResourceType::Service => "service",
+            ResourceType::Workflow => "workflow",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -242,6 +284,14 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             )
             .await
         }
+        Command::Describe {
+            name,
+            schema,
+            refresh,
+            list,
+            r#type,
+            filter,
+        } => dispatch_describe(cli, name, *schema, *refresh, *list, *r#type, filter).await,
     }
 }
 
@@ -307,6 +357,41 @@ async fn dispatch_query(
 
     let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
     query::run(&context.client, request_body, all).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_describe(
+    cli: &Cli,
+    name: &Option<String>,
+    schema: bool,
+    refresh: bool,
+    list: bool,
+    resource_type: ResourceType,
+    filter: &Option<String>,
+) -> Result<serde_json::Value, CliError> {
+    if !list && name.is_none() {
+        return Err(CliError::Usage("pass a resource name or --list".into()));
+    }
+    let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+    if list {
+        return describe::list_resources(&context.client, resource_type.as_str(), filter.clone())
+            .await;
+    }
+    let name = name.as_deref().expect("checked above");
+    let config = crate::config::Config::load(&crate::config::default_config_path())?;
+    let cache_ttl = Duration::from_secs(config.cache_ttl_hours.unwrap_or(24) * 3600);
+    let cache_dir = crate::config::default_cache_dir()
+        .join("metadata")
+        .join(&context.alias);
+    describe::describe_resource(
+        &context.client,
+        name,
+        schema,
+        &cache_dir,
+        refresh,
+        cache_ttl,
+    )
+    .await
 }
 
 async fn dispatch_object(cli: &Cli, action: &ObjectAction) -> Result<serde_json::Value, CliError> {
