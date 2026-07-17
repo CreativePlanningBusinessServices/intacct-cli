@@ -9,6 +9,7 @@ pub mod query;
 pub mod raw;
 pub mod report;
 pub mod skill;
+pub mod update;
 pub mod view;
 
 use std::io::Read;

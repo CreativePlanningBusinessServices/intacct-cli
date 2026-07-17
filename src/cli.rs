@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use crate::commands::{
     self, account, composite, config_cmd, describe, export, job, object, query, raw, report, skill,
-    view,
+    update, view,
 };
 use crate::config::AuthFlow;
 use crate::context::context_for;
@@ -165,6 +165,16 @@ pub enum Command {
     Skill {
         #[command(subcommand)]
         action: SkillAction,
+    },
+    /// Self-update from GitHub releases (requires GITHUB_TOKEN for this private repo)
+    #[command(after_help = "Examples:\n  intacct-cli update --check\n  intacct-cli update")]
+    Update {
+        /// Report the current/latest versions without installing
+        #[arg(long)]
+        check: bool,
+        /// Skip re-running `skill install` after a successful update
+        #[arg(long = "no-skill")]
+        no_skill: bool,
     },
 }
 
@@ -658,6 +668,7 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
         Command::Skill { action } => match action {
             SkillAction::Install { dir } => skill::install(dir.as_deref()),
         },
+        Command::Update { check, no_skill } => update::run(*check, *no_skill).await,
     }
 }
 
