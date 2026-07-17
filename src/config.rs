@@ -24,7 +24,7 @@ pub struct AccountEntry {
     pub flow: AuthFlow,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthFlow {
     ClientCredentials,

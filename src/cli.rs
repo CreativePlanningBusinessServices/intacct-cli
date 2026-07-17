@@ -1,0 +1,291 @@
+use std::io::IsTerminal;
+
+use clap::{Parser, Subcommand};
+
+use crate::commands::account;
+use crate::config::AuthFlow;
+use crate::context::context_for;
+use crate::error::CliError;
+use crate::output;
+use crate::secrets::KeyringStore;
+
+#[derive(Parser)]
+#[command(
+    name = "intacct-cli",
+    version,
+    about = "Sage Intacct REST API CLI for AI agents",
+    propagate_version = true,
+    color = clap::ColorChoice::Never
+)]
+pub struct Cli {
+    /// Account alias (falls back to $INTACCT_ACCOUNT, then the configured default)
+    #[arg(long, global = true)]
+    pub account: Option<String>,
+    /// Entity id for entity-scoped Intacct accounts (top-level companies ignore this)
+    #[arg(long, global = true)]
+    pub entity: Option<String>,
+    /// Pretty-print JSON output
+    #[arg(long, global = true)]
+    pub pretty: bool,
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Manage stored account credentials and aliases
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AccountAction {
+    /// Add or overwrite an account alias; the first account added becomes the default
+    #[command(
+        after_help = "Examples:\n  intacct-cli account add prod --company-id creativeplanning --flow client-credentials --client-id CID --user-id svc_api\n  intacct-cli account add sandbox --company-id creativeplanning --flow client-credentials --client-id CID --user-id svc_api --entity-id CentralUS-35\n\nThe client secret is never a flag: set INTACCT_CLI_CLIENT_SECRET, or run interactively to be prompted for it."
+    )]
+    Add {
+        alias: String,
+        #[arg(long = "company-id")]
+        company_id: String,
+        #[arg(long, value_enum)]
+        flow: AuthFlow,
+        #[arg(long = "client-id")]
+        client_id: String,
+        /// Required for the client-credentials flow
+        #[arg(long = "user-id")]
+        user_id: Option<String>,
+        #[arg(long = "entity-id")]
+        entity_id: Option<String>,
+    },
+    /// List configured account aliases (never prints secrets)
+    List,
+    /// Change which alias is used when --account/$INTACCT_ACCOUNT is not given
+    #[command(after_help = "Example: intacct-cli account set-default prod")]
+    SetDefault { alias: String },
+    /// Remove an account alias and its stored secrets
+    #[command(after_help = "Example: intacct-cli account remove prod")]
+    Remove { alias: String },
+    /// Verify stored credentials by calling the metadata catalog
+    #[command(
+        after_help = "Example: intacct-cli account test\n  intacct-cli account test --account prod"
+    )]
+    Test,
+}
+
+pub async fn cli_main() -> i32 {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(clap_error) => return handle_clap_error(&clap_error),
+    };
+    match dispatch(&cli).await {
+        Ok(result) => {
+            output::print_json(&result, cli.pretty);
+            0
+        }
+        Err(error) => {
+            output::print_error(&error);
+            error.exit_code() as i32
+        }
+    }
+}
+
+/// clap's own help/version/error rendering is human-readable text, not our stdout-JSON /
+/// stderr-JSON contract. `--help`/`--version` are a documented exception (human text on stdout,
+/// exit 0, matching what every other CLI does); every other parse failure (bad flag, missing
+/// required arg, invalid enum value, etc.) is folded into the same `CliError::Usage` envelope
+/// every other invocation error goes through, so an agent never has to special-case clap's output.
+fn handle_clap_error(clap_error: &clap::Error) -> i32 {
+    use clap::error::ErrorKind;
+    match clap_error.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            print!("{clap_error}");
+            0
+        }
+        _ => {
+            let usage_error = CliError::Usage(clap_error.render().to_string().trim().to_string());
+            output::print_error(&usage_error);
+            usage_error.exit_code() as i32
+        }
+    }
+}
+
+async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
+    match &cli.command {
+        Command::Account { action } => dispatch_account(cli, action).await,
+    }
+}
+
+async fn dispatch_account(
+    cli: &Cli,
+    action: &AccountAction,
+) -> Result<serde_json::Value, CliError> {
+    let config_path = crate::config::default_config_path();
+    let store = KeyringStore;
+    match action {
+        AccountAction::Add {
+            alias,
+            company_id,
+            flow,
+            client_id,
+            user_id,
+            entity_id,
+        } => {
+            let client_secret = resolve_client_secret()?;
+            account::add(
+                &config_path,
+                &store,
+                account::AddArgs {
+                    alias: alias.clone(),
+                    company_id: company_id.clone(),
+                    flow: *flow,
+                    client_id: client_id.clone(),
+                    client_secret,
+                    user_id: user_id.clone(),
+                    entity_id: entity_id.clone(),
+                },
+            )
+        }
+        AccountAction::List => account::list(&config_path),
+        AccountAction::SetDefault { alias } => account::set_default(&config_path, alias),
+        AccountAction::Remove { alias } => account::remove(&config_path, &store, alias),
+        AccountAction::Test => {
+            let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
+            account::test(&context).await
+        }
+    }
+}
+
+/// The client secret is never accepted as a CLI flag — that would leak it into shell history
+/// and `ps` output. Resolution order: env var (for CI/non-interactive use), then a hidden
+/// interactive prompt.
+fn resolve_client_secret() -> Result<String, CliError> {
+    if let Ok(secret) = std::env::var("INTACCT_CLI_CLIENT_SECRET") {
+        return Ok(secret);
+    }
+    if std::io::stdin().is_terminal() {
+        return rpassword::prompt_password("Client secret: ").map_err(|read_error| {
+            CliError::Usage(format!("failed to read client secret: {read_error}"))
+        });
+    }
+    Err(CliError::Usage(
+        "set INTACCT_CLI_CLIENT_SECRET or run interactively to be prompted".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    /// `Cli` intentionally has no `Debug` impl (it carries no state worth dumping), so
+    /// `Result::unwrap_err` (which requires `T: Debug`) doesn't work here; extract the error by
+    /// hand instead.
+    fn expect_parse_error(args: &[&str]) -> clap::Error {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("expected {args:?} to fail parsing"),
+            Err(clap_error) => clap_error,
+        }
+    }
+
+    #[test]
+    fn bad_flag_yields_a_usage_kind_error_and_exit_code_two() {
+        let clap_error = expect_parse_error(&["intacct-cli", "--bogus-flag"]);
+        assert_ne!(clap_error.kind(), ErrorKind::DisplayHelp);
+        assert_ne!(clap_error.kind(), ErrorKind::DisplayVersion);
+        assert_eq!(handle_clap_error(&clap_error), 2);
+    }
+
+    #[test]
+    fn help_flag_yields_display_help_kind_and_exit_code_zero() {
+        let clap_error = expect_parse_error(&["intacct-cli", "--help"]);
+        assert_eq!(clap_error.kind(), ErrorKind::DisplayHelp);
+        assert_eq!(handle_clap_error(&clap_error), 0);
+    }
+
+    #[test]
+    fn version_flag_yields_display_version_kind_and_exit_code_zero() {
+        let clap_error = expect_parse_error(&["intacct-cli", "--version"]);
+        assert_eq!(clap_error.kind(), ErrorKind::DisplayVersion);
+        assert_eq!(handle_clap_error(&clap_error), 0);
+    }
+
+    #[test]
+    fn account_add_parses_client_credentials_flow_with_kebab_case_value() {
+        let cli = Cli::try_parse_from([
+            "intacct-cli",
+            "account",
+            "add",
+            "prod",
+            "--company-id",
+            "creativeplanning",
+            "--flow",
+            "client-credentials",
+            "--client-id",
+            "CID",
+            "--user-id",
+            "svc_api",
+        ])
+        .expect("client-credentials add should parse");
+        let Command::Account {
+            action:
+                AccountAction::Add {
+                    alias,
+                    company_id,
+                    flow,
+                    client_id,
+                    user_id,
+                    entity_id,
+                },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(alias, "prod");
+        assert_eq!(company_id, "creativeplanning");
+        assert!(matches!(flow, AuthFlow::ClientCredentials));
+        assert_eq!(client_id, "CID");
+        assert_eq!(user_id.as_deref(), Some("svc_api"));
+        assert_eq!(entity_id, None);
+    }
+
+    #[test]
+    fn account_add_requires_flow_flag() {
+        expect_parse_error(&[
+            "intacct-cli",
+            "account",
+            "add",
+            "prod",
+            "--company-id",
+            "creativeplanning",
+            "--client-id",
+            "CID",
+        ]);
+    }
+
+    #[test]
+    fn account_subcommands_parse() {
+        Cli::try_parse_from(["intacct-cli", "account", "list"]).expect("list parses");
+        Cli::try_parse_from(["intacct-cli", "account", "set-default", "prod"])
+            .expect("set-default parses");
+        Cli::try_parse_from(["intacct-cli", "account", "remove", "prod"]).expect("remove parses");
+        Cli::try_parse_from(["intacct-cli", "account", "test"]).expect("test parses");
+    }
+
+    #[test]
+    fn global_flags_parse_before_and_after_subcommand() {
+        Cli::try_parse_from([
+            "intacct-cli",
+            "--account",
+            "prod",
+            "--entity",
+            "CentralUS-35",
+            "--pretty",
+            "account",
+            "list",
+        ])
+        .expect("global flags before subcommand should parse");
+    }
+}
