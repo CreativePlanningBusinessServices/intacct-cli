@@ -23,14 +23,8 @@ pub(crate) async fn listen_for_redirect<CallbackValue>(
     parse_query: impl Fn(&str) -> Result<CallbackValue, CliError>,
 ) -> Result<CallbackValue, CliError> {
     let acceptor = build_loopback_tls_acceptor()?;
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|bind_error| {
-            CliError::Network(format!(
-                "cannot bind https://localhost:{port}: {bind_error}"
-            ))
-        })?;
-    eprintln!("Waiting for the OAuth redirect on https://localhost:{port}/callback …");
+    let listener = bind_callback_listener(port).await?;
+    eprintln!("Waiting for the OAuth redirect on local port {port} …");
 
     match tokio::time::timeout(
         LOGIN_FLOW_TIMEOUT,
@@ -43,6 +37,28 @@ pub(crate) async fn listen_for_redirect<CallbackValue>(
             "login timed out after 5 minutes; re-run the command (or use --paste)".into(),
         )),
     }
+}
+
+/// Prefers a loopback-only bind, but macOS denies non-root binds to ports below 1024 on a
+/// specific address while allowing them on the wildcard address — and the default port is
+/// 443 (Sage refuses ports on the registered `https://127.0.0.1/...` redirect URI). So a
+/// loopback permission failure retries on the wildcard address. The listener is one-shot,
+/// TLS-terminated, and state-checked, so the wider bind only widens exposure to a
+/// denial-of-service on a single login attempt.
+async fn bind_callback_listener(port: u16) -> Result<TcpListener, CliError> {
+    let loopback_error = match TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => return Ok(listener),
+        Err(bind_error) => bind_error,
+    };
+    if loopback_error.kind() == ErrorKind::PermissionDenied
+        && let Ok(listener) = TcpListener::bind(("0.0.0.0", port)).await
+    {
+        return Ok(listener);
+    }
+    Err(CliError::Network(format!(
+        "cannot bind local port {port} for the OAuth redirect: {loopback_error} — if the port \
+         is busy or privileged on this machine, re-run with --paste"
+    )))
 }
 
 pub(crate) fn read_pasted_redirect<CallbackValue>(
@@ -109,10 +125,14 @@ async fn accept_callback<CallbackValue>(
 }
 
 fn build_loopback_tls_acceptor() -> Result<TlsAcceptor, CliError> {
-    let certified_key =
-        rcgen::generate_simple_self_signed(vec!["localhost".into()]).map_err(|cert_error| {
-            CliError::Auth(format!("cannot generate loopback TLS cert: {cert_error}"))
-        })?;
+    let certified_key = rcgen::generate_simple_self_signed(vec![
+        crate::auth::authcode::LOGIN_REDIRECT_HOST.into(),
+        "127.0.0.1".into(),
+        "localhost".into(),
+    ])
+    .map_err(|cert_error| {
+        CliError::Auth(format!("cannot generate loopback TLS cert: {cert_error}"))
+    })?;
     let cert_der: CertificateDer<'static> = certified_key.cert.der().clone();
     let key_der: PrivateKeyDer<'static> = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         certified_key.key_pair.serialize_der(),

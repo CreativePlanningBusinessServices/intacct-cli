@@ -21,7 +21,7 @@ pub struct LoginOptions {
 impl Default for LoginOptions {
     fn default() -> Self {
         LoginOptions {
-            port: 8899,
+            port: 443,
             paste: false,
         }
     }
@@ -144,10 +144,26 @@ async fn exchange_code(
         .map_err(|parse_error| CliError::Auth(format!("bad token response: {parse_error}")))
 }
 
+/// Public DNS name that resolves to 127.0.0.1 (the `localtest.me` service). A plain loopback
+/// host is unusable with Sage: their console rejects `localhost` and any host:port form in
+/// registered redirect URIs, and their WAF 403-blocks authorize requests whose redirect_uri
+/// contains `127.0.0.1` — a dotted DNS name is the only form that both registers and runs.
+pub(crate) const LOGIN_REDIRECT_HOST: &str = "redirect.localtest.me";
+
+/// The URI sent here must byte-match the registered one, and Sage refuses to register a port,
+/// so the default HTTPS port produces the portless form.
+fn login_redirect_uri(port: u16) -> String {
+    if port == 443 {
+        format!("https://{LOGIN_REDIRECT_HOST}/callback")
+    } else {
+        format!("https://{LOGIN_REDIRECT_HOST}:{port}/callback")
+    }
+}
+
 /// Interactive login: opens the browser at the authorize URL, then either reads the pasted
 /// redirect URL (`paste`) or runs a one-shot HTTPS loopback listener to catch the redirect
 /// itself. Intacct rejects plain `http://` redirect URIs, so the listener terminates TLS with
-/// a throwaway self-signed cert for `localhost`.
+/// a throwaway self-signed cert for the loopback address.
 pub async fn run_login_flow(
     http: &reqwest::Client,
     client_id: &str,
@@ -156,7 +172,7 @@ pub async fn run_login_flow(
 ) -> Result<TokenResponse, CliError> {
     let (verifier, challenge) = pkce_pair();
     let state = random_hex(32);
-    let redirect_uri = format!("https://localhost:{}/callback", options.port);
+    let redirect_uri = login_redirect_uri(options.port);
     let url = build_authorize_url(
         &account::authorize_url(),
         client_id,
@@ -320,11 +336,28 @@ mod tests {
     }
 
     #[test]
+    fn login_redirect_uri_uses_loopback_dns_name_and_omits_default_https_port() {
+        // Sage's console rejects `localhost` and any host:port form in registered
+        // redirect URIs, and its WAF 403-blocks authorize requests whose redirect_uri
+        // contains `127.0.0.1` — so the redirect host is a public DNS name resolving
+        // to loopback, and the default (443) must produce the portless form to
+        // byte-match the only registrable URI.
+        assert_eq!(
+            login_redirect_uri(443),
+            "https://redirect.localtest.me/callback"
+        );
+        assert_eq!(
+            login_redirect_uri(8899),
+            "https://redirect.localtest.me:8899/callback"
+        );
+    }
+
+    #[test]
     fn authorize_url_contains_all_oauth_params() {
         let url_string = build_authorize_url(
             "https://api.intacct.com/ia/api/v1/oauth2/authorize",
             "cid.app.sage.com",
-            "https://localhost:8899/callback",
+            "https://redirect.localtest.me:8899/callback",
             "deadbeefdeadbeefdeadbeefdeadbeef",
             "CHALLENGE",
         );
@@ -346,7 +379,7 @@ mod tests {
         );
         assert_eq!(
             params.get("redirect_uri").map(String::as_str),
-            Some("https://localhost:8899/callback")
+            Some("https://redirect.localtest.me:8899/callback")
         );
         assert_eq!(
             params.get("state").map(String::as_str),

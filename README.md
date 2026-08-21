@@ -35,9 +35,23 @@ intacct-cli account test        # verifies credentials end-to-end
 ```
 
 The first account added becomes the default; select others with `--account <alias>`
-or `$INTACCT_ACCOUNT`. Prerequisites (admin, once per company): a Web Services
-user, and the app's client ID authorized under Company > Setup > Company >
-Security > Authorized Client Applications.
+or `$INTACCT_ACCOUNT`. Prerequisites (admin, once per company): the Web Services
+subscription enabled (Company > Admin > Subscriptions), a Web Services user, and
+the app's client ID authorized (with that user ID) under Company > Setup >
+Company > Security > Authorized Client Applications. A company without the Web
+Services subscription fails every token request — both flows — with
+`invalid_grant: The provided credentials are invalid`.
+
+For the auth-code flow (`--flow auth-code`), the Sage app registration must list
+`https://redirect.localtest.me/callback` as a redirect URI. That exact form is
+forced by Sage: their console rejects `localhost` and any host:port combination,
+and their WAF blocks authorize requests whose redirect URI contains `127.0.0.1`
+— so the CLI uses `redirect.localtest.me`, a public DNS name that resolves to
+127.0.0.1, and listens on 443 to keep the URI portless. The redirect hits a
+local listener with a self-signed certificate, so the browser shows a warning —
+proceed through it. If something on your machine already occupies port 443,
+pass `--paste` instead: no listener is started, and you paste the browser's
+final redirect URL back into the CLI.
 
 ## Commands
 

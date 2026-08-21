@@ -524,8 +524,9 @@ pub enum AccountAction {
         user_id: Option<String>,
         #[arg(long = "entity-id")]
         entity_id: Option<String>,
-        /// Loopback port for the auth-code browser redirect
-        #[arg(long, default_value_t = 8899)]
+        /// Loopback port for the auth-code browser redirect (443 keeps the registered
+        /// redirect URI portless, the only form Sage accepts)
+        #[arg(long, default_value_t = 443)]
         port: u16,
         /// Skip the loopback listener; paste the redirect URL instead (auth-code flow only)
         #[arg(long)]
@@ -558,7 +559,7 @@ pub enum AccountAction {
         #[arg(long)]
         reauth: bool,
         /// Loopback port for the auth-code browser redirect, used with --reauth
-        #[arg(long, default_value_t = 8899)]
+        #[arg(long, default_value_t = 443)]
         port: u16,
         /// Skip the loopback listener; paste the redirect URL instead, used with --reauth
         #[arg(long)]
@@ -1080,7 +1081,7 @@ mod tests {
         assert_eq!(client_id, "CID");
         assert_eq!(user_id.as_deref(), Some("svc_api"));
         assert_eq!(entity_id, None);
-        assert_eq!(port, 8899);
+        assert_eq!(port, 443);
         assert!(!paste);
     }
 
