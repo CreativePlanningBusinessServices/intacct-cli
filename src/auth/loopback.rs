@@ -50,10 +50,10 @@ async fn bind_callback_listener(port: u16) -> Result<TcpListener, CliError> {
         Ok(listener) => return Ok(listener),
         Err(bind_error) => bind_error,
     };
-    if loopback_error.kind() == ErrorKind::PermissionDenied {
-        if let Ok(listener) = TcpListener::bind(("0.0.0.0", port)).await {
-            return Ok(listener);
-        }
+    if loopback_error.kind() == ErrorKind::PermissionDenied
+        && let Ok(listener) = TcpListener::bind(("0.0.0.0", port)).await
+    {
+        return Ok(listener);
     }
     Err(CliError::Network(format!(
         "cannot bind local port {port} for the OAuth redirect: {loopback_error} — if the port \
