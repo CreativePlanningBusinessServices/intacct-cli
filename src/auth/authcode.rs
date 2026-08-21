@@ -144,10 +144,17 @@ async fn exchange_code(
         .map_err(|parse_error| CliError::Auth(format!("bad token response: {parse_error}")))
 }
 
+/// The redirect host is the loopback IP, not `localhost`: Sage's developer console rejects
+/// `localhost` redirect URIs as "Invalid URL format" but accepts `https://127.0.0.1:<port>`,
+/// and the URI sent here must byte-match the registered one.
+fn login_redirect_uri(port: u16) -> String {
+    format!("https://127.0.0.1:{port}/callback")
+}
+
 /// Interactive login: opens the browser at the authorize URL, then either reads the pasted
 /// redirect URL (`paste`) or runs a one-shot HTTPS loopback listener to catch the redirect
 /// itself. Intacct rejects plain `http://` redirect URIs, so the listener terminates TLS with
-/// a throwaway self-signed cert for `localhost`.
+/// a throwaway self-signed cert for the loopback address.
 pub async fn run_login_flow(
     http: &reqwest::Client,
     client_id: &str,
@@ -156,7 +163,7 @@ pub async fn run_login_flow(
 ) -> Result<TokenResponse, CliError> {
     let (verifier, challenge) = pkce_pair();
     let state = random_hex(32);
-    let redirect_uri = format!("https://localhost:{}/callback", options.port);
+    let redirect_uri = login_redirect_uri(options.port);
     let url = build_authorize_url(
         &account::authorize_url(),
         client_id,
@@ -320,11 +327,22 @@ mod tests {
     }
 
     #[test]
+    fn login_redirect_uri_uses_loopback_ip() {
+        // Sage's developer console rejects `localhost` in registered redirect URIs
+        // (with or without a port) but accepts `https://127.0.0.1:<port>/...`, so the
+        // login flow must send the IP form to match what can actually be registered.
+        assert_eq!(
+            login_redirect_uri(8899),
+            "https://127.0.0.1:8899/callback"
+        );
+    }
+
+    #[test]
     fn authorize_url_contains_all_oauth_params() {
         let url_string = build_authorize_url(
             "https://api.intacct.com/ia/api/v1/oauth2/authorize",
             "cid.app.sage.com",
-            "https://localhost:8899/callback",
+            "https://127.0.0.1:8899/callback",
             "deadbeefdeadbeefdeadbeefdeadbeef",
             "CHALLENGE",
         );
@@ -346,7 +364,7 @@ mod tests {
         );
         assert_eq!(
             params.get("redirect_uri").map(String::as_str),
-            Some("https://localhost:8899/callback")
+            Some("https://127.0.0.1:8899/callback")
         );
         assert_eq!(
             params.get("state").map(String::as_str),

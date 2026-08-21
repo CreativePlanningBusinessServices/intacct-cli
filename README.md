@@ -39,6 +39,12 @@ or `$INTACCT_ACCOUNT`. Prerequisites (admin, once per company): a Web Services
 user, and the app's client ID authorized under Company > Setup > Company >
 Security > Authorized Client Applications.
 
+For the auth-code flow (`--flow auth-code`), the Sage app registration must list
+`https://127.0.0.1:8899/callback` as a redirect URI (match `--port` if you change
+it). Sage's developer console rejects `localhost` here — use the IP form. The
+login redirect hits a local listener with a self-signed certificate, so the
+browser shows a warning — proceed through it.
+
 ## Commands
 
 | You need | Command |

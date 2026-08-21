@@ -27,10 +27,10 @@ pub(crate) async fn listen_for_redirect<CallbackValue>(
         .await
         .map_err(|bind_error| {
             CliError::Network(format!(
-                "cannot bind https://localhost:{port}: {bind_error}"
+                "cannot bind https://127.0.0.1:{port}: {bind_error}"
             ))
         })?;
-    eprintln!("Waiting for the OAuth redirect on https://localhost:{port}/callback …");
+    eprintln!("Waiting for the OAuth redirect on https://127.0.0.1:{port}/callback …");
 
     match tokio::time::timeout(
         LOGIN_FLOW_TIMEOUT,
@@ -110,9 +110,10 @@ async fn accept_callback<CallbackValue>(
 
 fn build_loopback_tls_acceptor() -> Result<TlsAcceptor, CliError> {
     let certified_key =
-        rcgen::generate_simple_self_signed(vec!["localhost".into()]).map_err(|cert_error| {
-            CliError::Auth(format!("cannot generate loopback TLS cert: {cert_error}"))
-        })?;
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()])
+            .map_err(|cert_error| {
+                CliError::Auth(format!("cannot generate loopback TLS cert: {cert_error}"))
+            })?;
     let cert_der: CertificateDer<'static> = certified_key.cert.der().clone();
     let key_der: PrivateKeyDer<'static> = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         certified_key.key_pair.serialize_der(),
