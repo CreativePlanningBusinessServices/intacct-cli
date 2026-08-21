@@ -144,15 +144,19 @@ async fn exchange_code(
         .map_err(|parse_error| CliError::Auth(format!("bad token response: {parse_error}")))
 }
 
-/// The redirect host is the loopback IP, not `localhost`: Sage's developer console rejects
-/// `localhost` redirect URIs entirely and rejects ports on IP hosts, but accepts a bare
-/// `https://127.0.0.1/...`. The URI sent here must byte-match the registered one, so the
-/// default HTTPS port produces the portless form.
+/// Public DNS name that resolves to 127.0.0.1 (the `localtest.me` service). A plain loopback
+/// host is unusable with Sage: their console rejects `localhost` and any host:port form in
+/// registered redirect URIs, and their WAF 403-blocks authorize requests whose redirect_uri
+/// contains `127.0.0.1` — a dotted DNS name is the only form that both registers and runs.
+pub(crate) const LOGIN_REDIRECT_HOST: &str = "redirect.localtest.me";
+
+/// The URI sent here must byte-match the registered one, and Sage refuses to register a port,
+/// so the default HTTPS port produces the portless form.
 fn login_redirect_uri(port: u16) -> String {
     if port == 443 {
-        "https://127.0.0.1/callback".to_string()
+        format!("https://{LOGIN_REDIRECT_HOST}/callback")
     } else {
-        format!("https://127.0.0.1:{port}/callback")
+        format!("https://{LOGIN_REDIRECT_HOST}:{port}/callback")
     }
 }
 
@@ -332,15 +336,19 @@ mod tests {
     }
 
     #[test]
-    fn login_redirect_uri_uses_loopback_ip_and_omits_default_https_port() {
-        // Sage's developer console rejects `localhost` in registered redirect URIs
-        // (with or without a port) and rejects ports on IP hosts, but accepts a bare
-        // `https://127.0.0.1/...` — so the default (443) must produce the portless
-        // form to byte-match what can actually be registered.
-        assert_eq!(login_redirect_uri(443), "https://127.0.0.1/callback");
+    fn login_redirect_uri_uses_loopback_dns_name_and_omits_default_https_port() {
+        // Sage's console rejects `localhost` and any host:port form in registered
+        // redirect URIs, and its WAF 403-blocks authorize requests whose redirect_uri
+        // contains `127.0.0.1` — so the redirect host is a public DNS name resolving
+        // to loopback, and the default (443) must produce the portless form to
+        // byte-match the only registrable URI.
+        assert_eq!(
+            login_redirect_uri(443),
+            "https://redirect.localtest.me/callback"
+        );
         assert_eq!(
             login_redirect_uri(8899),
-            "https://127.0.0.1:8899/callback"
+            "https://redirect.localtest.me:8899/callback"
         );
     }
 
@@ -349,7 +357,7 @@ mod tests {
         let url_string = build_authorize_url(
             "https://api.intacct.com/ia/api/v1/oauth2/authorize",
             "cid.app.sage.com",
-            "https://127.0.0.1:8899/callback",
+            "https://redirect.localtest.me:8899/callback",
             "deadbeefdeadbeefdeadbeefdeadbeef",
             "CHALLENGE",
         );
@@ -371,7 +379,7 @@ mod tests {
         );
         assert_eq!(
             params.get("redirect_uri").map(String::as_str),
-            Some("https://127.0.0.1:8899/callback")
+            Some("https://redirect.localtest.me:8899/callback")
         );
         assert_eq!(
             params.get("state").map(String::as_str),

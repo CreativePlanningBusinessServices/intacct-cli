@@ -525,7 +525,7 @@ pub enum AccountAction {
         #[arg(long = "entity-id")]
         entity_id: Option<String>,
         /// Loopback port for the auth-code browser redirect (443 keeps the registered
-        /// redirect URI portless, which is the only form Sage accepts for 127.0.0.1)
+        /// redirect URI portless, the only form Sage accepts)
         #[arg(long, default_value_t = 443)]
         port: u16,
         /// Skip the loopback listener; paste the redirect URL instead (auth-code flow only)

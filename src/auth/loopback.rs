@@ -24,7 +24,7 @@ pub(crate) async fn listen_for_redirect<CallbackValue>(
 ) -> Result<CallbackValue, CliError> {
     let acceptor = build_loopback_tls_acceptor()?;
     let listener = bind_callback_listener(port).await?;
-    eprintln!("Waiting for the OAuth redirect on https://127.0.0.1:{port}/callback …");
+    eprintln!("Waiting for the OAuth redirect on local port {port} …");
 
     match tokio::time::timeout(
         LOGIN_FLOW_TIMEOUT,
@@ -56,8 +56,8 @@ async fn bind_callback_listener(port: u16) -> Result<TcpListener, CliError> {
         }
     }
     Err(CliError::Network(format!(
-        "cannot bind https://127.0.0.1:{port}: {loopback_error} — if the port is busy or \
-         privileged on this machine, re-run with --paste"
+        "cannot bind local port {port} for the OAuth redirect: {loopback_error} — if the port \
+         is busy or privileged on this machine, re-run with --paste"
     )))
 }
 
@@ -125,11 +125,14 @@ async fn accept_callback<CallbackValue>(
 }
 
 fn build_loopback_tls_acceptor() -> Result<TlsAcceptor, CliError> {
-    let certified_key =
-        rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()])
-            .map_err(|cert_error| {
-                CliError::Auth(format!("cannot generate loopback TLS cert: {cert_error}"))
-            })?;
+    let certified_key = rcgen::generate_simple_self_signed(vec![
+        crate::auth::authcode::LOGIN_REDIRECT_HOST.into(),
+        "127.0.0.1".into(),
+        "localhost".into(),
+    ])
+    .map_err(|cert_error| {
+        CliError::Auth(format!("cannot generate loopback TLS cert: {cert_error}"))
+    })?;
     let cert_der: CertificateDer<'static> = certified_key.cert.der().clone();
     let key_der: PrivateKeyDer<'static> = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         certified_key.key_pair.serialize_der(),
