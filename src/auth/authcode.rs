@@ -21,7 +21,7 @@ pub struct LoginOptions {
 impl Default for LoginOptions {
     fn default() -> Self {
         LoginOptions {
-            port: 8899,
+            port: 443,
             paste: false,
         }
     }
@@ -145,10 +145,15 @@ async fn exchange_code(
 }
 
 /// The redirect host is the loopback IP, not `localhost`: Sage's developer console rejects
-/// `localhost` redirect URIs as "Invalid URL format" but accepts `https://127.0.0.1:<port>`,
-/// and the URI sent here must byte-match the registered one.
+/// `localhost` redirect URIs entirely and rejects ports on IP hosts, but accepts a bare
+/// `https://127.0.0.1/...`. The URI sent here must byte-match the registered one, so the
+/// default HTTPS port produces the portless form.
 fn login_redirect_uri(port: u16) -> String {
-    format!("https://127.0.0.1:{port}/callback")
+    if port == 443 {
+        "https://127.0.0.1/callback".to_string()
+    } else {
+        format!("https://127.0.0.1:{port}/callback")
+    }
 }
 
 /// Interactive login: opens the browser at the authorize URL, then either reads the pasted
@@ -327,10 +332,12 @@ mod tests {
     }
 
     #[test]
-    fn login_redirect_uri_uses_loopback_ip() {
+    fn login_redirect_uri_uses_loopback_ip_and_omits_default_https_port() {
         // Sage's developer console rejects `localhost` in registered redirect URIs
-        // (with or without a port) but accepts `https://127.0.0.1:<port>/...`, so the
-        // login flow must send the IP form to match what can actually be registered.
+        // (with or without a port) and rejects ports on IP hosts, but accepts a bare
+        // `https://127.0.0.1/...` — so the default (443) must produce the portless
+        // form to byte-match what can actually be registered.
+        assert_eq!(login_redirect_uri(443), "https://127.0.0.1/callback");
         assert_eq!(
             login_redirect_uri(8899),
             "https://127.0.0.1:8899/callback"

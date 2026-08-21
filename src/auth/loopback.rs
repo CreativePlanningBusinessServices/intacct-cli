@@ -23,13 +23,7 @@ pub(crate) async fn listen_for_redirect<CallbackValue>(
     parse_query: impl Fn(&str) -> Result<CallbackValue, CliError>,
 ) -> Result<CallbackValue, CliError> {
     let acceptor = build_loopback_tls_acceptor()?;
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|bind_error| {
-            CliError::Network(format!(
-                "cannot bind https://127.0.0.1:{port}: {bind_error}"
-            ))
-        })?;
+    let listener = bind_callback_listener(port).await?;
     eprintln!("Waiting for the OAuth redirect on https://127.0.0.1:{port}/callback …");
 
     match tokio::time::timeout(
@@ -43,6 +37,28 @@ pub(crate) async fn listen_for_redirect<CallbackValue>(
             "login timed out after 5 minutes; re-run the command (or use --paste)".into(),
         )),
     }
+}
+
+/// Prefers a loopback-only bind, but macOS denies non-root binds to ports below 1024 on a
+/// specific address while allowing them on the wildcard address — and the default port is
+/// 443 (Sage refuses ports on the registered `https://127.0.0.1/...` redirect URI). So a
+/// loopback permission failure retries on the wildcard address. The listener is one-shot,
+/// TLS-terminated, and state-checked, so the wider bind only widens exposure to a
+/// denial-of-service on a single login attempt.
+async fn bind_callback_listener(port: u16) -> Result<TcpListener, CliError> {
+    let loopback_error = match TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => return Ok(listener),
+        Err(bind_error) => bind_error,
+    };
+    if loopback_error.kind() == ErrorKind::PermissionDenied {
+        if let Ok(listener) = TcpListener::bind(("0.0.0.0", port)).await {
+            return Ok(listener);
+        }
+    }
+    Err(CliError::Network(format!(
+        "cannot bind https://127.0.0.1:{port}: {loopback_error} — if the port is busy or \
+         privileged on this machine, re-run with --paste"
+    )))
 }
 
 pub(crate) fn read_pasted_redirect<CallbackValue>(

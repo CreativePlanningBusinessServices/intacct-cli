@@ -40,10 +40,14 @@ user, and the app's client ID authorized under Company > Setup > Company >
 Security > Authorized Client Applications.
 
 For the auth-code flow (`--flow auth-code`), the Sage app registration must list
-`https://127.0.0.1:8899/callback` as a redirect URI (match `--port` if you change
-it). Sage's developer console rejects `localhost` here — use the IP form. The
-login redirect hits a local listener with a self-signed certificate, so the
-browser shows a warning — proceed through it.
+`https://127.0.0.1/callback` as a redirect URI. That exact form matters: Sage's
+console rejects `localhost` entirely and rejects ports on IP hosts, so the CLI
+listens on 443 by default and sends the portless URI (`--port` overrides both,
+but then the registered URI needs the port too — which Sage currently refuses).
+The login redirect hits a local listener with a self-signed certificate, so the
+browser shows a warning — proceed through it. If something on your machine
+already occupies port 443, pass `--paste` instead: no listener is started, and
+you paste the browser's final redirect URL back into the CLI.
 
 ## Commands
 
