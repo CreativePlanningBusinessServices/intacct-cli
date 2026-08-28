@@ -99,6 +99,58 @@ async fn add_with_app_source_stores_a_reference_not_copied_credentials() {
 }
 
 #[tokio::test]
+async fn re_add_with_inline_credentials_replaces_an_app_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let store = intacct_cli::secrets::ResolvingStore::new(MemoryStore::default());
+    store
+        .set_app(
+            "main",
+            &AppSecrets {
+                client_id: "app-cid".into(),
+                client_secret: "app-secret".into(),
+            },
+        )
+        .unwrap();
+    let http = reqwest::Client::new();
+
+    let mut args = add_args("acme");
+    args.credentials = account::CredentialSource::App {
+        name: "main".into(),
+        client_id: "app-cid".into(),
+        client_secret: "app-secret".into(),
+    };
+    account::add(&config_path, &store, &http, args)
+        .await
+        .unwrap();
+
+    // Re-add the same alias with explicit inline credentials: the app reference must be
+    // fully replaced, not silently preserved by the resolving store's rotation rule.
+    let mut args = add_args("acme");
+    args.credentials = account::CredentialSource::Inline {
+        client_id: "inline-cid".into(),
+        client_secret: "inline-secret".into(),
+    };
+    account::add(&config_path, &store, &http, args)
+        .await
+        .unwrap();
+
+    match store.get("acme").unwrap().expect("secrets stored") {
+        AccountSecrets::ClientCredentials {
+            client_id,
+            client_secret,
+            ..
+        } => {
+            assert_eq!(client_id, "inline-cid");
+            assert_eq!(client_secret, "inline-secret");
+        }
+        other => panic!("expected inline credentials, got: {other:?}"),
+    }
+    let config = intacct_cli::config::Config::load(&config_path).unwrap();
+    assert_eq!(config.accounts["acme"].app, None);
+}
+
+#[tokio::test]
 async fn add_stores_config_and_secrets_and_first_account_becomes_default() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");

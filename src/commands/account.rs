@@ -103,9 +103,23 @@ fn add_client_credentials(
             username,
         },
     };
-    store.set(&args.alias, &secrets)?;
+    replace_account_secrets(store, &args.alias, &secrets)?;
 
     Ok(add_result(&args, "client-credentials", is_default))
+}
+
+/// `account add` overwrites, so the previous entry (and its cached token) is deleted before
+/// the new secrets are written. The delete also matters for correctness: `ResolvingStore::set`
+/// deliberately preserves an existing app *reference* when a provider writes back materialized
+/// inline credentials, and without the delete that rule would also capture a re-add that is
+/// explicitly switching the account from an app reference to its own inline credentials.
+fn replace_account_secrets(
+    store: &dyn SecretStore,
+    alias: &str,
+    secrets: &AccountSecrets,
+) -> Result<(), CliError> {
+    store.delete(alias)?;
+    store.set(alias, secrets)
 }
 
 fn add_result(args: &AddArgs, flow: &str, is_default: bool) -> Value {
@@ -158,7 +172,7 @@ async fn add_auth_code(
             refresh_token: token.refresh_token.clone(),
         },
     };
-    store.set(&args.alias, &secrets)?;
+    replace_account_secrets(store, &args.alias, &secrets)?;
 
     Ok(add_result(&args, "auth-code", is_default))
 }
