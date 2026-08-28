@@ -593,7 +593,9 @@ pub enum AppAction {
     /// List registered apps (never prints secrets)
     List,
     /// Re-store an app's secret (and optionally client id) — use after rotating in the Sage console
-    #[command(after_help = "Example: intacct-cli app update intacct-cli   # prompts for the new secret")]
+    #[command(
+        after_help = "Example: intacct-cli app update intacct-cli   # prompts for the new secret"
+    )]
     Update {
         name: String,
         #[arg(long = "client-id")]

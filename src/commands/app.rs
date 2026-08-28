@@ -74,7 +74,9 @@ pub fn update(
 ) -> Result<Value, CliError> {
     let mut config = Config::load(config_path)?;
     let entry = config.apps.get_mut(name).ok_or_else(|| {
-        CliError::Usage(format!("unknown client app '{name}'; run `intacct-cli app list`"))
+        CliError::Usage(format!(
+            "unknown client app '{name}'; run `intacct-cli app list`"
+        ))
     })?;
     if let Some(new_client_id) = client_id {
         entry.client_id = new_client_id.to_string();

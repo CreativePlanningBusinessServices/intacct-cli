@@ -82,7 +82,9 @@ async fn add_with_app_source_stores_a_reference_not_copied_credentials() {
         client_id: "cid.app.sage.com".into(),
         client_secret: "shhh".into(),
     };
-    let result = account::add(&config_path, &store, &http, args).await.unwrap();
+    let result = account::add(&config_path, &store, &http, args)
+        .await
+        .unwrap();
     assert_eq!(result["app"], "main");
 
     match store.get("acme").unwrap().expect("secrets stored") {
