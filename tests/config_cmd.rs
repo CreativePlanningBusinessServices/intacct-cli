@@ -11,8 +11,10 @@ fn add_args(alias: &str) -> AddArgs {
         alias: alias.into(),
         company_id: "creativeplanning".into(),
         flow: AuthFlow::ClientCredentials,
-        client_id: "cid.app.sage.com".into(),
-        client_secret: "shhh".into(),
+        credentials: account::CredentialSource::Inline {
+            client_id: "cid.app.sage.com".into(),
+            client_secret: "shhh".into(),
+        },
         user_id: Some("svc_api".into()),
         entity_id: None,
         port: 8899,

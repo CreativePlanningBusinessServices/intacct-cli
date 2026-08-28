@@ -5,14 +5,14 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::commands::{
-    self, account, composite, config_cmd, describe, export, job, object, query, raw, report, skill,
-    update, view,
+    self, account, app, composite, config_cmd, describe, export, job, object, query, raw, report,
+    skill, update, view,
 };
 use crate::config::AuthFlow;
 use crate::context::context_for;
 use crate::error::CliError;
 use crate::output;
-use crate::secrets::KeyringStore;
+use crate::secrets::{KeyringStore, ResolvingStore};
 
 #[derive(Parser)]
 #[command(
@@ -42,6 +42,11 @@ pub enum Command {
     Account {
         #[command(subcommand)]
         action: AccountAction,
+    },
+    /// Manage registered client applications (shared client id/secret for account setup)
+    App {
+        #[command(subcommand)]
+        action: AppAction,
     },
     /// Get or set configuration values
     Config {
@@ -517,8 +522,12 @@ pub enum AccountAction {
         company_id: String,
         #[arg(long, value_enum)]
         flow: AuthFlow,
+        /// Explicit client id; omit to use a registered app (see `intacct-cli app add`)
         #[arg(long = "client-id")]
-        client_id: String,
+        client_id: Option<String>,
+        /// Registered app to take the client id/secret from (defaults to the default app)
+        #[arg(long, conflicts_with = "client_id")]
+        app: Option<String>,
         /// Required for the client-credentials flow
         #[arg(long = "user-id")]
         user_id: Option<String>,
@@ -567,6 +576,40 @@ pub enum AccountAction {
     },
 }
 
+#[derive(Subcommand)]
+pub enum AppAction {
+    /// Register a client application; the first app added becomes the default
+    #[command(
+        after_help = "Examples:\n  intacct-cli app add intacct-cli --client-id CID\n  intacct-cli app add intacct-cli --client-id CID --client-secret SECRET\n\nWithout --client-secret, the secret comes from INTACCT_CLI_CLIENT_SECRET or an interactive prompt. Accounts then need no client creds:\n  intacct-cli account add acme --company-id acme --flow auth-code"
+    )]
+    Add {
+        name: String,
+        #[arg(long = "client-id")]
+        client_id: String,
+        /// Client secret (visible in shell history — prefer the env var or prompt when scripting)
+        #[arg(long = "client-secret")]
+        client_secret: Option<String>,
+    },
+    /// List registered apps (never prints secrets)
+    List,
+    /// Re-store an app's secret (and optionally client id) — use after rotating in the Sage console
+    #[command(
+        after_help = "Example: intacct-cli app update intacct-cli   # prompts for the new secret"
+    )]
+    Update {
+        name: String,
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        /// New client secret (visible in shell history — prefer the env var or prompt)
+        #[arg(long = "client-secret")]
+        client_secret: Option<String>,
+    },
+    /// Change which app is used when `account add` gets no --app/--client-id
+    SetDefault { name: String },
+    /// Remove an app and its stored secret (refused while accounts still reference it)
+    Remove { name: String },
+}
+
 pub async fn cli_main() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -607,6 +650,7 @@ fn handle_clap_error(clap_error: &clap::Error) -> i32 {
 async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
     match &cli.command {
         Command::Account { action } => dispatch_account(cli, action).await,
+        Command::App { action } => dispatch_app(action),
         Command::Config { action } => dispatch_config(action),
         Command::Object { action } => dispatch_object(cli, action).await,
         Command::Query {
@@ -932,19 +976,25 @@ async fn dispatch_account(
     action: &AccountAction,
 ) -> Result<serde_json::Value, CliError> {
     let config_path = crate::config::default_config_path();
-    let store = KeyringStore;
+    let store = ResolvingStore::new(KeyringStore);
     match action {
         AccountAction::Add {
             alias,
             company_id,
             flow,
             client_id,
+            app,
             user_id,
             entity_id,
             port,
             paste,
         } => {
-            let client_secret = resolve_client_secret()?;
+            let credentials = resolve_credential_source(
+                &config_path,
+                &store,
+                client_id.as_deref(),
+                app.as_deref(),
+            )?;
             let http = reqwest::Client::new();
             account::add(
                 &config_path,
@@ -954,8 +1004,7 @@ async fn dispatch_account(
                     alias: alias.clone(),
                     company_id: company_id.clone(),
                     flow: *flow,
-                    client_id: client_id.clone(),
-                    client_secret,
+                    credentials,
                     user_id: user_id.clone(),
                     entity_id: entity_id.clone(),
                     port: *port,
@@ -988,10 +1037,13 @@ async fn dispatch_account(
     }
 }
 
-/// The client secret is never accepted as a CLI flag — that would leak it into shell history
-/// and `ps` output. Resolution order: env var (for CI/non-interactive use), then a hidden
-/// interactive prompt.
-fn resolve_client_secret() -> Result<String, CliError> {
+/// Resolution order: explicit flag (only the `app` commands offer one — it leaks into
+/// shell history, so account add stays flagless), then the env var (for CI and
+/// non-interactive use), then a hidden interactive prompt.
+fn resolve_client_secret(flag: Option<&str>) -> Result<String, CliError> {
+    if let Some(secret) = flag {
+        return Ok(secret.to_string());
+    }
     if let Ok(secret) = std::env::var("INTACCT_CLI_CLIENT_SECRET") {
         return Ok(secret);
     }
@@ -1003,6 +1055,61 @@ fn resolve_client_secret() -> Result<String, CliError> {
     Err(CliError::Usage(
         "set INTACCT_CLI_CLIENT_SECRET or run interactively to be prompted".into(),
     ))
+}
+
+/// With `--client-id`, the account gets its own copy of the credentials (secret via env or
+/// prompt, as before). Without it, the named (or default) registered app supplies them and
+/// the account stores only a reference — no secret ever crosses the command line.
+fn resolve_credential_source(
+    config_path: &std::path::Path,
+    store: &dyn crate::secrets::SecretStore,
+    client_id: Option<&str>,
+    app_flag: Option<&str>,
+) -> Result<account::CredentialSource, CliError> {
+    if let Some(client_id) = client_id {
+        return Ok(account::CredentialSource::Inline {
+            client_id: client_id.to_string(),
+            client_secret: resolve_client_secret(None)?,
+        });
+    }
+    let config = crate::config::Config::load(config_path)?;
+    let name = config.resolve_app_name(app_flag)?;
+    let app_secrets = store.get_app(&name)?.ok_or_else(|| {
+        CliError::Auth(format!(
+            "client app '{name}' has no stored secret; run `intacct-cli app add`"
+        ))
+    })?;
+    Ok(account::CredentialSource::App {
+        name,
+        client_id: app_secrets.client_id,
+        client_secret: app_secrets.client_secret,
+    })
+}
+
+fn dispatch_app(action: &AppAction) -> Result<serde_json::Value, CliError> {
+    let config_path = crate::config::default_config_path();
+    let store = KeyringStore;
+    match action {
+        AppAction::Add {
+            name,
+            client_id,
+            client_secret,
+        } => {
+            let secret = resolve_client_secret(client_secret.as_deref())?;
+            app::add(&config_path, &store, name, client_id, &secret)
+        }
+        AppAction::List => app::list(&config_path),
+        AppAction::Update {
+            name,
+            client_id,
+            client_secret,
+        } => {
+            let secret = resolve_client_secret(client_secret.as_deref())?;
+            app::update(&config_path, &store, name, client_id.as_deref(), &secret)
+        }
+        AppAction::SetDefault { name } => app::set_default(&config_path, name),
+        AppAction::Remove { name } => app::remove(&config_path, &store, name),
+    }
 }
 
 #[cfg(test)]
@@ -1066,6 +1173,7 @@ mod tests {
                     company_id,
                     flow,
                     client_id,
+                    app,
                     user_id,
                     entity_id,
                     port,
@@ -1078,7 +1186,8 @@ mod tests {
         assert_eq!(alias, "prod");
         assert_eq!(company_id, "creativeplanning");
         assert!(matches!(flow, AuthFlow::ClientCredentials));
-        assert_eq!(client_id, "CID");
+        assert_eq!(client_id.as_deref(), Some("CID"));
+        assert_eq!(app, None);
         assert_eq!(user_id.as_deref(), Some("svc_api"));
         assert_eq!(entity_id, None);
         assert_eq!(port, 443);
@@ -1120,6 +1229,89 @@ mod tests {
         assert_eq!(user_id, None);
         assert_eq!(port, 9000);
         assert!(paste);
+    }
+
+    #[test]
+    fn account_add_without_client_id_parses_with_optional_app() {
+        let cli = Cli::try_parse_from([
+            "intacct-cli",
+            "account",
+            "add",
+            "acme",
+            "--company-id",
+            "acme",
+            "--flow",
+            "auth-code",
+            "--app",
+            "main",
+        ])
+        .expect("app-based add should parse");
+        let Command::Account {
+            action: AccountAction::Add { client_id, app, .. },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(client_id, None);
+        assert_eq!(app.as_deref(), Some("main"));
+
+        // --app and --client-id are mutually exclusive
+        assert!(
+            Cli::try_parse_from([
+                "intacct-cli",
+                "account",
+                "add",
+                "acme",
+                "--company-id",
+                "acme",
+                "--flow",
+                "auth-code",
+                "--client-id",
+                "CID",
+                "--app",
+                "main",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn app_add_parses_with_and_without_secret_flag() {
+        let cli = Cli::try_parse_from([
+            "intacct-cli",
+            "app",
+            "add",
+            "main",
+            "--client-id",
+            "CID",
+            "--client-secret",
+            "shhh",
+        ])
+        .expect("app add should parse");
+        let Command::App {
+            action:
+                AppAction::Add {
+                    name,
+                    client_id,
+                    client_secret,
+                },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(name, "main");
+        assert_eq!(client_id, "CID");
+        assert_eq!(client_secret.as_deref(), Some("shhh"));
+
+        let cli = Cli::try_parse_from(["intacct-cli", "app", "add", "main", "--client-id", "CID"])
+            .expect("secret flag is optional");
+        let Command::App {
+            action: AppAction::Add { client_secret, .. },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(client_secret, None);
     }
 
     #[test]

@@ -30,17 +30,27 @@ document types are `application/document::Name` (quote it), custom objects are
 
 ## Bootstrap (once per machine)
 
+Register the client app once, then accounts need no credentials:
+
 ```bash
-export INTACCT_CLI_CLIENT_SECRET='<secret>'   # or omit to be prompted interactively
+intacct-cli app add myapp --client-id <clientId>   # prompts for the secret once
 intacct-cli account add prod --company-id <companyId> --flow client-credentials \
-  --client-id <clientId> --user-id <webServicesUserId>
+  --user-id <webServicesUserId>
 intacct-cli account test        # verifies credentials end-to-end
 ```
 
+`app add`/`app update` also take `--client-secret <secret>` (one-step, but lands in
+shell history) or `$INTACCT_CLI_CLIENT_SECRET`. After rotating the secret in the
+Sage console, `intacct-cli app update myapp` fixes every referencing account.
+`account add --client-id <id>` still works for one-off inline credentials.
+`--flow auth-code` opens a browser login instead of needing a Web Services user.
+
 First account added becomes the default; select others with `--account <alias>` or
-`$INTACCT_ACCOUNT`. Prereqs (admin, once per company): a Web Services user, and the
-app's client ID authorized under Company > Setup > Company > Security > Authorized
-Client Applications.
+`$INTACCT_ACCOUNT`. Prereqs (admin, once per company): the Web Services subscription
+enabled (Company > Admin > Subscriptions — without it every token request fails with
+`invalid_grant: The provided credentials are invalid`), a Web Services user, and the
+app's client ID authorized (with that user ID) under Company > Setup > Company >
+Security > Authorized Client Applications.
 
 ## Recipes
 
