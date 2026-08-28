@@ -1,4 +1,5 @@
 pub mod account;
+pub mod app;
 pub mod composite;
 pub mod config_cmd;
 pub mod describe;

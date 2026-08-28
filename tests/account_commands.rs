@@ -5,7 +5,7 @@ use std::sync::Arc;
 use intacct_cli::commands::account::{self, AddArgs};
 use intacct_cli::config::AuthFlow;
 use intacct_cli::error::CliError;
-use intacct_cli::secrets::{AccountSecrets, CachedToken, MemoryStore, SecretStore};
+use intacct_cli::secrets::{AccountSecrets, AppSecrets, CachedToken, MemoryStore, SecretStore};
 use serde_json::json;
 
 /// A `SecretStore` whose `set` always fails, used to prove that `account::add` writes the
@@ -42,6 +42,15 @@ impl SecretStore for FailingSecretStore {
     fn delete_token(&self, alias: &str) -> Result<(), CliError> {
         self.inner.delete_token(alias)
     }
+    fn get_app(&self, name: &str) -> Result<Option<AppSecrets>, CliError> {
+        self.inner.get_app(name)
+    }
+    fn set_app(&self, name: &str, app: &AppSecrets) -> Result<(), CliError> {
+        self.inner.set_app(name, app)
+    }
+    fn delete_app(&self, name: &str) -> Result<(), CliError> {
+        self.inner.delete_app(name)
+    }
 }
 
 fn add_args(alias: &str) -> AddArgs {
@@ -49,13 +58,42 @@ fn add_args(alias: &str) -> AddArgs {
         alias: alias.into(),
         company_id: "creativeplanning".into(),
         flow: AuthFlow::ClientCredentials,
-        client_id: "cid.app.sage.com".into(),
-        client_secret: "shhh".into(),
+        credentials: account::CredentialSource::Inline {
+            client_id: "cid.app.sage.com".into(),
+            client_secret: "shhh".into(),
+        },
         user_id: Some("svc_api".into()),
         entity_id: None,
         port: 8899,
         paste: false,
     }
+}
+
+#[tokio::test]
+async fn add_with_app_source_stores_a_reference_not_copied_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let store = MemoryStore::default();
+    let http = reqwest::Client::new();
+
+    let mut args = add_args("acme");
+    args.credentials = account::CredentialSource::App {
+        name: "main".into(),
+        client_id: "cid.app.sage.com".into(),
+        client_secret: "shhh".into(),
+    };
+    let result = account::add(&config_path, &store, &http, args).await.unwrap();
+    assert_eq!(result["app"], "main");
+
+    match store.get("acme").unwrap().expect("secrets stored") {
+        AccountSecrets::ClientCredentialsApp { app, username } => {
+            assert_eq!(app, "main");
+            assert_eq!(username, "svc_api@creativeplanning");
+        }
+        other => panic!("expected an app reference, got: {other:?}"),
+    }
+    let config = intacct_cli::config::Config::load(&config_path).unwrap();
+    assert_eq!(config.accounts["acme"].app.as_deref(), Some("main"));
 }
 
 #[tokio::test]

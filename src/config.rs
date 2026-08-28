@@ -10,6 +10,10 @@ pub struct Config {
     pub default_account: Option<String>,
     #[serde(default)]
     pub accounts: BTreeMap<String, AccountEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_app: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub apps: BTreeMap<String, AppEntry>,
     #[serde(default)]
     pub cache_ttl_hours: Option<u64>,
 }
@@ -21,7 +25,16 @@ pub struct AccountEntry {
     pub user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
     pub flow: AuthFlow,
+}
+
+/// A registered Sage client application the CLI can reference by name. Only the
+/// non-secret half lives in the config file; the secret is in the OS keychain.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppEntry {
+    pub client_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, clap::ValueEnum)]
@@ -73,6 +86,20 @@ impl Config {
         }
         Ok(alias)
     }
+
+    pub fn resolve_app_name(&self, flag: Option<&str>) -> Result<String, CliError> {
+        let name = flag
+            .map(str::to_string)
+            .or_else(|| self.default_app.clone())
+            .ok_or_else(|| CliError::Usage(
+                "no client app selected: pass --app, run `intacct-cli app add`, or provide --client-id".into()))?;
+        if !self.apps.contains_key(&name) {
+            return Err(CliError::Usage(format!(
+                "unknown client app '{name}'; run `intacct-cli app list`"
+            )));
+        }
+        Ok(name)
+    }
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -101,6 +128,7 @@ mod tests {
                 company_id: "creativeplanning".into(),
                 user_id: Some("svc_api".into()),
                 entity_id: None,
+                app: None,
                 flow: AuthFlow::ClientCredentials,
             },
         );
@@ -110,10 +138,18 @@ mod tests {
                 company_id: "creativeplanning-snd".into(),
                 user_id: None,
                 entity_id: Some("CentralUS-35".into()),
+                app: Some("main".into()),
                 flow: AuthFlow::AuthCode,
             },
         );
         config.default_account = Some("prod".into());
+        config.apps.insert(
+            "main".into(),
+            AppEntry {
+                client_id: "cid.app.sage.com".into(),
+            },
+        );
+        config.default_app = Some("main".into());
         config
     }
 
@@ -140,6 +176,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loaded = Config::load(&dir.path().join("nope.toml")).unwrap();
         assert!(loaded.accounts.is_empty());
+    }
+
+    #[test]
+    fn apps_round_trip_through_toml_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sample_config().save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.default_app.as_deref(), Some("main"));
+        assert_eq!(loaded.apps["main"].client_id, "cid.app.sage.com");
+        assert_eq!(loaded.accounts["sandbox"].app.as_deref(), Some("main"));
+        assert_eq!(loaded.accounts["prod"].app, None);
+    }
+
+    #[test]
+    fn app_name_resolution_prefers_flag_then_default() {
+        let config = sample_config();
+        assert_eq!(config.resolve_app_name(Some("main")).unwrap(), "main");
+        assert_eq!(config.resolve_app_name(None).unwrap(), "main");
+        assert!(matches!(
+            config.resolve_app_name(Some("nope")),
+            Err(CliError::Usage(_))
+        ));
+        assert!(matches!(
+            Config::default().resolve_app_name(None),
+            Err(CliError::Usage(_))
+        ));
     }
 
     #[test]

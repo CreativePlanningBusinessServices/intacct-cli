@@ -16,12 +16,50 @@ pub struct AddArgs {
     pub alias: String,
     pub company_id: String,
     pub flow: AuthFlow,
-    pub client_id: String,
-    pub client_secret: String,
+    pub credentials: CredentialSource,
     pub user_id: Option<String>,
     pub entity_id: Option<String>,
     pub port: u16,
     pub paste: bool,
+}
+
+/// Where an account's client id/secret come from: given inline at add time (and copied
+/// into the account's keychain entry), or resolved through a named app registered with
+/// `intacct-cli app add` (the account stores only a reference, so rotating the app's
+/// secret covers every referencing account).
+pub enum CredentialSource {
+    Inline {
+        client_id: String,
+        client_secret: String,
+    },
+    App {
+        name: String,
+        client_id: String,
+        client_secret: String,
+    },
+}
+
+impl CredentialSource {
+    fn client_id(&self) -> &str {
+        match self {
+            CredentialSource::Inline { client_id, .. }
+            | CredentialSource::App { client_id, .. } => client_id,
+        }
+    }
+
+    fn client_secret(&self) -> &str {
+        match self {
+            CredentialSource::Inline { client_secret, .. }
+            | CredentialSource::App { client_secret, .. } => client_secret,
+        }
+    }
+
+    fn app_name(&self) -> Option<&str> {
+        match self {
+            CredentialSource::Inline { .. } => None,
+            CredentialSource::App { name, .. } => Some(name),
+        }
+    }
 }
 
 pub async fn add(
@@ -51,21 +89,36 @@ fn add_client_credentials(
     // and re-runnable state ("no credentials stored for '<alias>'; run account add"). The
     // reverse order can leave secrets under an alias the config never learns about.
     let is_default = write_account_entry(config_path, &args)?;
-    store.set(
-        &args.alias,
-        &AccountSecrets::ClientCredentials {
-            client_id: args.client_id.clone(),
-            client_secret: args.client_secret.clone(),
+    let secrets = match &args.credentials {
+        CredentialSource::Inline {
+            client_id,
+            client_secret,
+        } => AccountSecrets::ClientCredentials {
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
             username,
         },
-    )?;
+        CredentialSource::App { name, .. } => AccountSecrets::ClientCredentialsApp {
+            app: name.clone(),
+            username,
+        },
+    };
+    store.set(&args.alias, &secrets)?;
 
-    Ok(json!({
+    Ok(add_result(&args, "client-credentials", is_default))
+}
+
+fn add_result(args: &AddArgs, flow: &str, is_default: bool) -> Value {
+    let mut result = json!({
         "alias": args.alias,
         "companyId": args.company_id,
-        "flow": "client-credentials",
+        "flow": flow,
         "default": is_default,
-    }))
+    });
+    if let Some(app) = args.credentials.app_name() {
+        result["app"] = json!(app);
+    }
+    result
 }
 
 /// The auth-code flow has no offline `--user-id`/secret pair to validate up front — the only
@@ -82,8 +135,8 @@ async fn add_auth_code(
     let is_default = write_account_entry(config_path, &args)?;
     let token = authcode::run_login_flow(
         http,
-        &args.client_id,
-        &args.client_secret,
+        args.credentials.client_id(),
+        args.credentials.client_secret(),
         authcode::LoginOptions {
             port: args.port,
             paste: args.paste,
@@ -91,21 +144,23 @@ async fn add_auth_code(
     )
     .await?;
 
-    store.set(
-        &args.alias,
-        &AccountSecrets::AuthCode {
-            client_id: args.client_id.clone(),
-            client_secret: args.client_secret.clone(),
+    let secrets = match &args.credentials {
+        CredentialSource::Inline {
+            client_id,
+            client_secret,
+        } => AccountSecrets::AuthCode {
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
             refresh_token: token.refresh_token.clone(),
         },
-    )?;
+        CredentialSource::App { name, .. } => AccountSecrets::AuthCodeApp {
+            app: name.clone(),
+            refresh_token: token.refresh_token.clone(),
+        },
+    };
+    store.set(&args.alias, &secrets)?;
 
-    Ok(json!({
-        "alias": args.alias,
-        "companyId": args.company_id,
-        "flow": "auth-code",
-        "default": is_default,
-    }))
+    Ok(add_result(&args, "auth-code", is_default))
 }
 
 pub fn list(config_path: &Path) -> Result<Value, CliError> {
@@ -125,6 +180,9 @@ pub fn list(config_path: &Path) -> Result<Value, CliError> {
             }
             if let Some(entity_id) = &entry.entity_id {
                 account["entityId"] = json!(entity_id);
+            }
+            if let Some(app) = &entry.app {
+                account["app"] = json!(app);
             }
             account
         })
@@ -334,6 +392,7 @@ fn write_account_entry(config_path: &Path, args: &AddArgs) -> Result<bool, CliEr
             company_id: args.company_id.clone(),
             user_id: args.user_id.clone(),
             entity_id: args.entity_id.clone(),
+            app: args.credentials.app_name().map(str::to_string),
             flow: args.flow,
         },
     );

@@ -27,12 +27,24 @@ the supported platforms; Linux is CI-only.
 
 ## Bootstrap (once per machine)
 
+Register the client application once, then add accounts with just an alias and
+company id — no per-account credential entry:
+
 ```bash
-export INTACCT_CLI_CLIENT_SECRET='<secret>'   # or omit to be prompted interactively
+intacct-cli app add myapp --client-id <clientId>   # prompts for the secret once
 intacct-cli account add prod --company-id <companyId> --flow client-credentials \
-  --client-id <clientId> --user-id <webServicesUserId>
+  --user-id <webServicesUserId>
+intacct-cli account add acme --company-id <companyId2> --flow auth-code
 intacct-cli account test        # verifies credentials end-to-end
 ```
+
+`app add` also accepts `--client-secret <secret>` for one-step scripted setup
+(it lands in shell history — prefer `$INTACCT_CLI_CLIENT_SECRET` or the prompt
+when that matters). Accounts added this way store a *reference* to the app, so
+after rotating the secret in the Sage console a single `intacct-cli app update
+myapp` fixes every account at once. Passing `--client-id` to `account add`
+still works and stores that account its own copy of the credentials (secret
+via env var or prompt).
 
 The first account added becomes the default; select others with `--account <alias>`
 or `$INTACCT_ACCOUNT`. Prerequisites (admin, once per company): the Web Services

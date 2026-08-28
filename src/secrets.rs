@@ -18,6 +18,23 @@ pub enum AccountSecrets {
         client_secret: String,
         refresh_token: Option<String>,
     },
+    /// Like `ClientCredentials`, but the client id/secret live in the named app's
+    /// keychain entry instead of being copied here — rotating the app's secret
+    /// updates every referencing account at once.
+    ClientCredentialsApp { app: String, username: String },
+    /// Like `AuthCode`, with the client id/secret resolved through the named app.
+    AuthCodeApp {
+        app: String,
+        refresh_token: Option<String>,
+    },
+}
+
+/// The secret half of a registered client application (`intacct-cli app add`);
+/// the name → client-id mapping lives in the config file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSecrets {
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +58,9 @@ pub trait SecretStore: Send + Sync {
     fn get_token(&self, alias: &str) -> Result<Option<CachedToken>, CliError>;
     fn set_token(&self, alias: &str, token: &CachedToken) -> Result<(), CliError>;
     fn delete_token(&self, alias: &str) -> Result<(), CliError>;
+    fn get_app(&self, name: &str) -> Result<Option<AppSecrets>, CliError>;
+    fn set_app(&self, name: &str, app: &AppSecrets) -> Result<(), CliError>;
+    fn delete_app(&self, name: &str) -> Result<(), CliError>;
 }
 
 pub struct KeyringStore;
@@ -104,6 +124,105 @@ impl SecretStore for KeyringStore {
     fn delete_token(&self, alias: &str) -> Result<(), CliError> {
         KeyringStore::remove(&format!("{alias}#token"))
     }
+    fn get_app(&self, name: &str) -> Result<Option<AppSecrets>, CliError> {
+        KeyringStore::read(&format!("app#{name}"))
+    }
+    fn set_app(&self, name: &str, app: &AppSecrets) -> Result<(), CliError> {
+        KeyringStore::write(&format!("app#{name}"), app)
+    }
+    fn delete_app(&self, name: &str) -> Result<(), CliError> {
+        KeyringStore::remove(&format!("app#{name}"))
+    }
+}
+
+/// Wraps a [`SecretStore`] so app-referencing account entries behave exactly like inline
+/// ones to the token providers: `get` materializes `*App` variants by pulling the client
+/// id/secret from the app's entry, and `set` preserves the reference when a provider
+/// writes back a materialized value (the auth-code provider persists rotated refresh
+/// tokens as inline `AuthCode` — only the refresh token must survive that write).
+pub struct ResolvingStore<Inner: SecretStore> {
+    inner: Inner,
+}
+
+impl<Inner: SecretStore> ResolvingStore<Inner> {
+    pub fn new(inner: Inner) -> Self {
+        ResolvingStore { inner }
+    }
+
+    fn app_secrets(&self, name: &str) -> Result<AppSecrets, CliError> {
+        self.inner.get_app(name)?.ok_or_else(|| {
+            CliError::Auth(format!(
+                "client app '{name}' has no stored secret; run `intacct-cli app add`"
+            ))
+        })
+    }
+}
+
+impl<Inner: SecretStore> SecretStore for ResolvingStore<Inner> {
+    fn get(&self, alias: &str) -> Result<Option<AccountSecrets>, CliError> {
+        match self.inner.get(alias)? {
+            Some(AccountSecrets::ClientCredentialsApp { app, username }) => {
+                let creds = self.app_secrets(&app)?;
+                Ok(Some(AccountSecrets::ClientCredentials {
+                    client_id: creds.client_id,
+                    client_secret: creds.client_secret,
+                    username,
+                }))
+            }
+            Some(AccountSecrets::AuthCodeApp { app, refresh_token }) => {
+                let creds = self.app_secrets(&app)?;
+                Ok(Some(AccountSecrets::AuthCode {
+                    client_id: creds.client_id,
+                    client_secret: creds.client_secret,
+                    refresh_token,
+                }))
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn set(&self, alias: &str, secrets: &AccountSecrets) -> Result<(), CliError> {
+        let preserved = match (self.inner.get(alias)?, secrets) {
+            (
+                Some(AccountSecrets::AuthCodeApp { app, .. }),
+                AccountSecrets::AuthCode { refresh_token, .. },
+            ) => Some(AccountSecrets::AuthCodeApp {
+                app,
+                refresh_token: refresh_token.clone(),
+            }),
+            (
+                Some(AccountSecrets::ClientCredentialsApp { app, .. }),
+                AccountSecrets::ClientCredentials { username, .. },
+            ) => Some(AccountSecrets::ClientCredentialsApp {
+                app,
+                username: username.clone(),
+            }),
+            _ => None,
+        };
+        self.inner.set(alias, preserved.as_ref().unwrap_or(secrets))
+    }
+
+    fn delete(&self, alias: &str) -> Result<(), CliError> {
+        self.inner.delete(alias)
+    }
+    fn get_token(&self, alias: &str) -> Result<Option<CachedToken>, CliError> {
+        self.inner.get_token(alias)
+    }
+    fn set_token(&self, alias: &str, token: &CachedToken) -> Result<(), CliError> {
+        self.inner.set_token(alias, token)
+    }
+    fn delete_token(&self, alias: &str) -> Result<(), CliError> {
+        self.inner.delete_token(alias)
+    }
+    fn get_app(&self, name: &str) -> Result<Option<AppSecrets>, CliError> {
+        self.inner.get_app(name)
+    }
+    fn set_app(&self, name: &str, app: &AppSecrets) -> Result<(), CliError> {
+        self.inner.set_app(name, app)
+    }
+    fn delete_app(&self, name: &str) -> Result<(), CliError> {
+        self.inner.delete_app(name)
+    }
 }
 
 #[derive(Default)]
@@ -154,6 +273,16 @@ impl SecretStore for MemoryStore {
             .lock()
             .unwrap()
             .remove(&format!("{alias}#token"));
+        Ok(())
+    }
+    fn get_app(&self, name: &str) -> Result<Option<AppSecrets>, CliError> {
+        self.read(&format!("app#{name}"))
+    }
+    fn set_app(&self, name: &str, app: &AppSecrets) -> Result<(), CliError> {
+        self.write(&format!("app#{name}"), app)
+    }
+    fn delete_app(&self, name: &str) -> Result<(), CliError> {
+        self.entries.lock().unwrap().remove(&format!("app#{name}"));
         Ok(())
     }
 }
@@ -217,5 +346,142 @@ mod tests {
         };
         let raw = serde_json::to_string(&secrets).unwrap();
         assert!(raw.contains(r#""kind":"auth-code""#), "got: {raw}");
+
+        let app_ref = AccountSecrets::AuthCodeApp {
+            app: "main".into(),
+            refresh_token: None,
+        };
+        let raw = serde_json::to_string(&app_ref).unwrap();
+        assert!(raw.contains(r#""kind":"auth-code-app""#), "got: {raw}");
+    }
+
+    fn store_with_app() -> ResolvingStore<MemoryStore> {
+        let store = ResolvingStore::new(MemoryStore::default());
+        store
+            .set_app(
+                "main",
+                &AppSecrets {
+                    client_id: "cid.app.sage.com".into(),
+                    client_secret: "app-secret".into(),
+                },
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn resolving_store_materializes_app_references_on_get() {
+        let store = store_with_app();
+        store
+            .set(
+                "acme",
+                &AccountSecrets::AuthCodeApp {
+                    app: "main".into(),
+                    refresh_token: Some("rt".into()),
+                },
+            )
+            .unwrap();
+        match store.get("acme").unwrap().expect("stored") {
+            AccountSecrets::AuthCode {
+                client_id,
+                client_secret,
+                refresh_token,
+            } => {
+                assert_eq!(client_id, "cid.app.sage.com");
+                assert_eq!(client_secret, "app-secret");
+                assert_eq!(refresh_token.as_deref(), Some("rt"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        store
+            .set(
+                "acme-svc",
+                &AccountSecrets::ClientCredentialsApp {
+                    app: "main".into(),
+                    username: "cli@acme".into(),
+                },
+            )
+            .unwrap();
+        match store.get("acme-svc").unwrap().expect("stored") {
+            AccountSecrets::ClientCredentials {
+                client_secret,
+                username,
+                ..
+            } => {
+                assert_eq!(client_secret, "app-secret");
+                assert_eq!(username, "cli@acme");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolving_store_keeps_reference_when_provider_writes_back_inline() {
+        let store = store_with_app();
+        store
+            .set(
+                "acme",
+                &AccountSecrets::AuthCodeApp {
+                    app: "main".into(),
+                    refresh_token: Some("old-rt".into()),
+                },
+            )
+            .unwrap();
+        // Simulate the auth-code provider persisting a rotated refresh token as a
+        // materialized inline value.
+        store
+            .set(
+                "acme",
+                &AccountSecrets::AuthCode {
+                    client_id: "cid.app.sage.com".into(),
+                    client_secret: "app-secret".into(),
+                    refresh_token: Some("rotated-rt".into()),
+                },
+            )
+            .unwrap();
+        // The underlying entry must still be an app reference with the new token.
+        match store.inner.get("acme").unwrap().expect("stored") {
+            AccountSecrets::AuthCodeApp { app, refresh_token } => {
+                assert_eq!(app, "main");
+                assert_eq!(refresh_token.as_deref(), Some("rotated-rt"));
+            }
+            other => panic!("reference was lost: {other:?}"),
+        }
+        // A later secret rotation on the app is picked up on the next get.
+        store
+            .set_app(
+                "main",
+                &AppSecrets {
+                    client_id: "cid.app.sage.com".into(),
+                    client_secret: "rotated-secret".into(),
+                },
+            )
+            .unwrap();
+        match store.get("acme").unwrap().expect("stored") {
+            AccountSecrets::AuthCode { client_secret, .. } => {
+                assert_eq!(client_secret, "rotated-secret")
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolving_store_errors_clearly_when_app_secret_is_missing() {
+        let store = ResolvingStore::new(MemoryStore::default());
+        store
+            .set(
+                "orphan",
+                &AccountSecrets::AuthCodeApp {
+                    app: "ghost".into(),
+                    refresh_token: None,
+                },
+            )
+            .unwrap();
+        let error = store.get("orphan").unwrap_err();
+        assert!(
+            error.to_string().contains("ghost"),
+            "error should name the missing app: {error}"
+        );
     }
 }

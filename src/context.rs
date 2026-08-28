@@ -7,7 +7,7 @@ use crate::auth::client_credentials::{ClientCredentialsConfig, ClientCredentials
 use crate::client::IaClient;
 use crate::config::{AccountEntry, AuthFlow, Config};
 use crate::error::CliError;
-use crate::secrets::{AccountSecrets, KeyringStore, SecretStore};
+use crate::secrets::{AccountSecrets, KeyringStore, ResolvingStore, SecretStore};
 
 pub struct AccountContext {
     pub alias: String,
@@ -23,7 +23,7 @@ pub fn context_for(
     let env_alias = std::env::var("INTACCT_ACCOUNT").ok();
     let alias = config.resolve_alias(alias_flag, env_alias.as_deref())?;
     let entry = &config.accounts[&alias];
-    let store: Arc<dyn SecretStore> = Arc::new(KeyringStore);
+    let store: Arc<dyn SecretStore> = Arc::new(ResolvingStore::new(KeyringStore));
     let provider = provider_for(&alias, entry, store)?;
     let entity = entity_flag
         .map(str::to_string)
