@@ -92,11 +92,11 @@ pub enum Command {
         /// List available resources instead of describing one
         #[arg(long)]
         list: bool,
-        /// Resource type to list; only valid with --list
-        #[arg(long, value_enum, default_value = "object", requires = "list")]
-        r#type: ResourceType,
-        /// Regex filtering the listed resource names; only valid with --list
-        #[arg(long, requires = "list")]
+        /// Resource type to list (default: object); only valid with --list
+        #[arg(long, value_enum)]
+        r#type: Option<ResourceType>,
+        /// Regex over the listed names as describe takes them (e.g. accounts-payable/vendor); only valid with --list
+        #[arg(long)]
         filter: Option<String>,
     },
     /// Send an arbitrary request to any Intacct REST endpoint
@@ -862,14 +862,21 @@ async fn dispatch_describe(
     schema: bool,
     refresh: bool,
     list: bool,
-    resource_type: ResourceType,
+    resource_type: Option<ResourceType>,
     filter: &Option<String>,
 ) -> Result<serde_json::Value, CliError> {
     if !list && name.is_none() {
         return Err(CliError::Usage("pass a resource name or --list".into()));
     }
+    // clap's `requires = "list"` is always satisfied because the bool flag defaults to false.
+    if !list && (resource_type.is_some() || filter.is_some()) {
+        return Err(CliError::Usage(
+            "--type and --filter only apply with --list".into(),
+        ));
+    }
     let context = context_for(cli.account.as_deref(), cli.entity.as_deref())?;
     if list {
+        let resource_type = resource_type.unwrap_or(ResourceType::Object);
         return describe::list_resources(&context.client, resource_type.as_str(), filter.clone())
             .await;
     }

@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use regex::Regex;
 use serde_json::Value;
 
 use crate::client::IaClient;
@@ -40,25 +41,55 @@ pub async fn describe_resource(
     Ok(metadata)
 }
 
+/// The model service's `type` param only matches exact types (rootObject, ownedObject,
+/// coreService, ...), so the object/service families are filtered here instead.
 pub async fn list_resources(
     client: &IaClient,
     resource_type: &str,
     name_filter: Option<String>,
 ) -> Result<Value, CliError> {
-    let mut query = vec![("type", resource_type.to_string())];
-    if let Some(filter) = name_filter {
-        query.push(("filter", filter));
-    }
+    let name_pattern = name_filter
+        .map(|filter| {
+            Regex::new(&filter)
+                .map_err(|error| CliError::Usage(format!("invalid --filter regex: {error}")))
+        })
+        .transpose()?;
     let response = client
-        .request(
-            reqwest::Method::GET,
-            "/services/core/model",
-            &query,
-            &[],
-            None,
-        )
+        .request(reqwest::Method::GET, "/services/core/model", &[], &[], None)
         .await?;
-    Ok(response.body.unwrap_or(Value::Null))
+    let mut catalog = response.body.unwrap_or(Value::Null);
+    let Some(resources) = catalog["ia::result"].as_array_mut() else {
+        return Ok(catalog);
+    };
+    resources.retain(|resource| {
+        belongs_to_family(resource, resource_type)
+            && name_pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.is_match(describe_name(resource)))
+    });
+    let listed_count = resources.len();
+    if let Some(meta) = catalog["ia::meta"].as_object_mut() {
+        meta.insert("totalCount".into(), listed_count.into());
+        meta.insert("totalSuccess".into(), listed_count.into());
+    }
+    Ok(catalog)
+}
+
+fn belongs_to_family(resource: &Value, resource_type: &str) -> bool {
+    let model_type = resource["type"].as_str().unwrap_or_default();
+    match resource_type {
+        "object" => model_type.ends_with("Object"),
+        "service" => model_type.ends_with("Service"),
+        _ => model_type == resource_type,
+    }
+}
+
+/// The name `describe` accepts: apiObject without its objects/, services/ or workflows/ prefix.
+fn describe_name(resource: &Value) -> &str {
+    let api_object = resource["apiObject"].as_str().unwrap_or_default();
+    api_object
+        .split_once('/')
+        .map_or(api_object, |(_, name)| name)
 }
 
 fn sanitize(name: &str) -> String {
