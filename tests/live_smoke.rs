@@ -17,6 +17,14 @@ async fn model_service_lists_objects() {
             .await
             .unwrap();
     println!("{result}");
+    let listed = result["ia::result"].as_array().unwrap();
+    assert!(!listed.is_empty(), "expected accounts-payable objects");
+    assert!(listed.iter().all(|resource| {
+        resource["apiObject"]
+            .as_str()
+            .unwrap()
+            .starts_with("objects/accounts-payable/")
+    }));
 }
 
 #[tokio::test]

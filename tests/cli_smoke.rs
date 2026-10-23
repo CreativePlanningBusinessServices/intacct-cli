@@ -11,6 +11,26 @@ fn help_exits_zero_and_prints_the_about_line() {
         .stdout(predicate::str::contains("Sage Intacct REST API CLI"));
 }
 
+#[test]
+fn describe_filter_without_list_is_a_usage_error() {
+    let mut command = Command::cargo_bin("intacct-cli").unwrap();
+    command
+        .args(["describe", "accounts-payable/vendor", "--filter", "vendor"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--list"));
+}
+
+#[test]
+fn describe_type_without_list_is_a_usage_error() {
+    let mut command = Command::cargo_bin("intacct-cli").unwrap();
+    command
+        .args(["describe", "accounts-payable/vendor", "--type", "service"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--list"));
+}
+
 // Windows-only: `directories::ProjectDirs` resolves config paths through Known Folder APIs,
 // not the $HOME/$XDG_CONFIG_HOME env vars this test uses to force an empty, hermetic config —
 // so on Windows it could pick up a real config file on the CI/dev machine instead. The --help
